@@ -248,9 +248,13 @@ func (c *Collector) applyIncremental(job string, st *state.JobState, allBuilds [
 		}
 	}
 
-	// 水位线推进到可得最大 finished number（running 构建不计入水位线）。
+	// 水位线只进不退：仅当可得最大 finished number 超过当前水位线时才推进，
+	// 避免 Jenkins 返回不全（构建删除/API 间歇/索引重建）时水位线回退导致重复计数。
 	if len(finished) > 0 {
-		st.LastSeenBuild = finished[len(finished)-1].Number
+		maxNum := finished[len(finished)-1].Number
+		if maxNum > st.LastSeenBuild {
+			st.LastSeenBuild = maxNum
+		}
 	}
 	c.metrics.JobConsecutiveFailures.WithLabelValues(job).Set(float64(st.ConsecutiveFailures))
 	c.metrics.JobLastSuccessTimestamp.WithLabelValues(job).Set(float64(st.LastSuccessTimestamp))

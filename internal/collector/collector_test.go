@@ -264,6 +264,39 @@ func TestRunningBuildNotWaterline(t *testing.T) {
 	}
 }
 
+func TestWaterlineNeverRegresses(t *testing.T) {
+	// 基线：水位线 = 3。
+	src := &mockSource{
+		topJobs:     []jenkins.Job{{Name: "j", Class: "hudson.model.FreeStyleProject"}},
+		buildsByJob: map[string][]jenkins.Build{"j": baselineBuilds()},
+	}
+	col, _, m := newCollector(t, src, []string{"j"}, nil)
+	col.RefreshOnce(context.Background())
+
+	st := col.State().Get("j")
+	if st.LastSeenBuild != 3 {
+		t.Fatalf("基线水位线 = %d, want 3", st.LastSeenBuild)
+	}
+	failureBefore := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "FAILURE"))
+
+	// 第二次：Jenkins 返回不全，只回 [1,2]（全部 number ≤ last_seen），模拟构建删除/API 间歇。
+	src.buildsByJob["j"] = []jenkins.Build{
+		{Number: 1, Result: ptr("SUCCESS"), Duration: 60000, Timestamp: 1698000000000},
+		{Number: 2, Result: ptr("FAILURE"), Duration: 120000, Timestamp: 1698000010000},
+	}
+	col.RefreshOnce(context.Background())
+
+	st = col.State().Get("j")
+	if st.LastSeenBuild != 3 {
+		t.Errorf("水位线回退 = %d, want 3（水位线只进不退）", st.LastSeenBuild)
+	}
+	// 已计数过的构建不应重复 Inc。
+	failureAfter := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "FAILURE"))
+	if failureAfter != failureBefore {
+		t.Errorf("回退刷新导致重复计数: FAILURE counter %v -> %v", failureBefore, failureAfter)
+	}
+}
+
 func TestEmptyBuildHistoryBaseline(t *testing.T) {
 	src := &mockSource{
 		topJobs:     []jenkins.Job{{Name: "j", Class: "hudson.model.FreeStyleProject"}},
