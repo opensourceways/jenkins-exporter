@@ -1,0 +1,16 @@
+# Service：端口名必须 http，供 monitor-agent 抓取 /metrics。
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-exporter
+  namespace: jenkins-exporter
+  labels:
+    app: jenkins-exporter
+spec:
+  selector:
+    app: jenkins-exporter
+  ports:
+    - name: http
+      port: 9300
+      targetPort: 9300
+      protocol: TCP

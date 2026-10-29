@@ -1,0 +1,6 @@
+{
+  "jobs": [
+    {"name": "ci-gate-pr", "_class": "hudson.model.FreeStyleProject", "url": "http://jenkins.jenkins.svc.cluster.local:8080/job/ci-gate-pr"},
+    {"name": "pkg-build", "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob", "url": "http://jenkins.jenkins.svc.cluster.local:8080/job/pkg-build"}
+  ]
+}

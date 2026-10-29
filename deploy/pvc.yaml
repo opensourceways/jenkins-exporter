@@ -1,0 +1,12 @@
+# /data 持久化 state.json（水位线），RWO PVC 与 Recreate 策略配合单副本。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-exporter-state
+  namespace: jenkins-exporter
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
