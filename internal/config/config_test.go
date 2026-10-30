@@ -102,3 +102,27 @@ func TestLoadInvalidDurations(t *testing.T) {
 		t.Fatal("SCRAPE_INTERVAL=0s 应报错")
 	}
 }
+
+func TestLoadOnlineRequiresWhitelist(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"OFFLINE":       "false",
+		"JENKINS_URL":   "http://jenkins.jenkins.svc.cluster.local:8080",
+		"JENKINS_USER":  "reader",
+		"JOB_WHITELIST": "",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("JOB_WHITELIST 为空应报错（否则启动正常但不采集任何 job）")
+	}
+}
+
+func TestLoadOnlineRejectsWhitespaceInWhitelist(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"OFFLINE":       "false",
+		"JENKINS_URL":   "http://jenkins.jenkins.svc.cluster.local:8080",
+		"JENKINS_USER":  "reader",
+		"JOB_WHITELIST": "job1 job2",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("白名单条目含空格应报错（形如 job1 job2 的写法永远匹配不到）")
+	}
+}

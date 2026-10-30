@@ -61,6 +61,15 @@ func (c Config) validate() error {
 	if c.HTTPTimeout <= 0 {
 		return fmt.Errorf("HTTP_TIMEOUT 必须为正")
 	}
+	// 白名单为空会导致“启动正常但一个 job 都不采集”，必须显式报错。
+	if len(c.JobWhitelist) == 0 {
+		return fmt.Errorf("JOB_WHITELIST 必填（逗号分隔的 job 全路径）")
+	}
+	for _, job := range c.JobWhitelist {
+		if strings.ContainsAny(job, " \t\r\n") {
+			return fmt.Errorf("JOB_WHITELIST 条目 %q 含空白字符，job 全路径不应包含空格", job)
+		}
+	}
 	return nil
 }
 

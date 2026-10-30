@@ -98,7 +98,7 @@ go test ./... -cover
 - `namespace.yaml` — ns `jenkins-exporter`
 - `pvc.yaml` — 1Gi RWO（state.json）
 - `configmap.yaml` — 非密配置
-- `secret.yaml` / `secretdefinition.yaml` — token 走 Vault→Secret 文件挂载（不用 envFrom）
+- `secretdefinition.yaml` — token 由 secrets-manager 从 Vault 同步成 Secret，再文件挂载（不用 envFrom）
 - `deployment.yaml` — 1 副本 + Recreate、非 root、readOnlyRootFilesystem、drop ALL、探针 `GET /metrics`、资源 50m/100Mi→200m/200Mi
 - `service.yaml` — 端口名 `http`
 - `networkpolicy.yaml` — egress 仅到 Jenkins Service，ingress 仅来自 monitor-agent ns
