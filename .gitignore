@@ -1,0 +1,12 @@
+# 二进制构建产物
+/exporter
+*.exe
+
+# 本地 state 调试文件
+state.json
+*.tmp
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/

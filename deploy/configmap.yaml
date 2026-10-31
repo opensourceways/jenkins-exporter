@@ -1,0 +1,13 @@
+# 非密配置：刷新间隔、超时、监听地址、白名单、离线开关等。
+# token 走 Secret 文件挂载，不在此处。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jenkins-exporter-config
+  namespace: jenkins-exporter
+data:
+  SCRAPE_INTERVAL: "60s"
+  HTTP_TIMEOUT: "10s"
+  LISTEN_ADDR: ":9300"
+  STATE_PATH: "/data/state.json"
+  JOB_WHITELIST: "ci-gate-pr,pkg-build"

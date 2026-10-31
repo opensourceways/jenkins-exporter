@@ -1,0 +1,6 @@
+{
+  "computer": [
+    {"displayName": "x86-infra-0", "offline": false, "temporarilyOffline": false, "numExecutors": 4, "busyExecutors": 2},
+    {"displayName": "x86-infra-1", "offline": true, "temporarilyOffline": false, "numExecutors": 4, "busyExecutors": 0}
+  ]
+}

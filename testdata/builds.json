@@ -1,0 +1,6 @@
+{
+  "builds": [
+    {"number": 5, "result": "SUCCESS", "duration": 120000, "timestamp": 1698000000000, "builtOn": "x86-infra-0"},
+    {"number": 6, "result": "FAILURE", "duration": 90000, "timestamp": 1698000100000, "builtOn": "x86-infra-1"}
+  ]
+}

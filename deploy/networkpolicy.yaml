@@ -1,0 +1,36 @@
+# NetworkPolicy：egress 仅到 Jenkins Service；ingress /metrics 仅来自 monitor-agent ns。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jenkins-exporter-netpol
+  namespace: jenkins-exporter
+spec:
+  podSelector:
+    matchLabels:
+      app: jenkins-exporter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitor-agent
+      ports:
+        - port: 9300
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+    # Jenkins controller Service（同集群 ns jenkins）
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jenkins
+      ports:
+        - port: 8080
+          protocol: TCP

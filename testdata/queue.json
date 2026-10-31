@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"id": 101, "why": "等待 executor", "inQueueSince": 1698000200000, "task": {"name": "ci-gate-pr"}},
+    {"id": 102, "why": "等待 executor", "inQueueSince": 1698000205000, "task": {"name": "pkg-build"}}
+  ]
+}
