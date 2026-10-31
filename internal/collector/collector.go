@@ -210,8 +210,8 @@ func (c *Collector) applyBaseline(job string, st *state.JobState, finished []jen
 		st.LastSuccessTimestamp = maxSuccessTs / 1000
 	}
 	st.ConsecutiveFailures = 0
-	c.metrics.JobConsecutiveFailures.WithLabelValues(job).Set(0)
-	c.metrics.JobLastSuccessTimestamp.WithLabelValues(job).Set(float64(st.LastSuccessTimestamp))
+	c.metrics.JobConsecutiveFailures.Set(0, job)
+	c.metrics.JobLastSuccessTimestamp.Set(float64(st.LastSuccessTimestamp), job)
 }
 
 // applyIncremental 处理水位线之后的新 finished 构建，累加指标并推进水位线。
@@ -225,8 +225,8 @@ func (c *Collector) applyIncremental(job string, st *state.JobState, allBuilds [
 			result = *b.Result
 		}
 		if jenkins.IsKnownResult(result) {
-			c.metrics.BuildResultTotal.WithLabelValues(job, result).Inc()
-			c.metrics.BuildDurationSeconds.WithLabelValues(job).Observe(float64(b.Duration) / 1000.0)
+			c.metrics.BuildResultTotal.Inc(job, result)
+			c.metrics.BuildDurationSeconds.Observe(float64(b.Duration)/1000.0, job)
 			switch result {
 			case jenkins.ResultSuccess:
 				st.ConsecutiveFailures = 0
@@ -256,8 +256,8 @@ func (c *Collector) applyIncremental(job string, st *state.JobState, allBuilds [
 			st.LastSeenBuild = maxNum
 		}
 	}
-	c.metrics.JobConsecutiveFailures.WithLabelValues(job).Set(float64(st.ConsecutiveFailures))
-	c.metrics.JobLastSuccessTimestamp.WithLabelValues(job).Set(float64(st.LastSuccessTimestamp))
+	c.metrics.JobConsecutiveFailures.Set(float64(st.ConsecutiveFailures), job)
+	c.metrics.JobLastSuccessTimestamp.Set(float64(st.LastSuccessTimestamp), job)
 }
 
 func (c *Collector) updateComputers(comps []jenkins.Computer) {
@@ -267,7 +267,7 @@ func (c *Collector) updateComputers(comps []jenkins.Computer) {
 		if !comp.Offline {
 			v = 1.0
 		}
-		c.metrics.AgentOnline.WithLabelValues(comp.DisplayName).Set(v)
+		c.metrics.AgentOnline.Set(v, comp.DisplayName)
 		busy += comp.BusyExecutors
 	}
 	c.metrics.ExecutorBusy.Set(float64(busy))

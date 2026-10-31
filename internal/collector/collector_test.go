@@ -11,6 +11,8 @@ import (
 
 	"github.com/opensourceways/jenkins-exporter/internal/jenkins"
 	"github.com/opensourceways/jenkins-exporter/internal/state"
+
+	obsmetrics "github.com/opensourceways/obs-sdk/go/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -84,16 +86,27 @@ func (m *mockSource) Queue(_ context.Context) ([]jenkins.QueueItem, error) {
 	return m.queue, nil
 }
 
+// testCommunity 是单测里 obs-sdk 的部署级 community 默认值。
+const testCommunity = "test"
+
+// newTestMetrics 构造独立的 obs-sdk 指标装配（不注册 go/process 采集器，便于断言）。
+func newTestMetrics() *obsmetrics.Metrics {
+	noProcess := false
+	return obsmetrics.New(obsmetrics.Config{
+		Service: "jenkins-exporter", Community: testCommunity, IncludeProcess: &noProcess,
+	})
+}
+
 func newCollector(t *testing.T, src jenkins.DataSource, whitelist []string, st *state.State) (*Collector, *prometheus.Registry, *Metrics) {
 	t.Helper()
 	dir := t.TempDir()
-	reg := prometheus.NewRegistry()
-	m := NewMetrics(reg)
+	om := newTestMetrics()
+	m := NewMetrics(om)
 	if st == nil {
 		st = state.New()
 	}
 	col := NewCollector(src, whitelist, st, dir+"/state.json", m, 60*time.Second, testLog())
-	return col, reg, m
+	return col, om.Registry(), m
 }
 
 func baselineBuilds() []jenkins.Build {
@@ -116,17 +129,17 @@ func TestBaselineDoesNotAccumulateCounters(t *testing.T) {
 	if !ok {
 		t.Fatal("基线刷新应成功")
 	}
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j1", "FAILURE")); v != 0 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j1", "FAILURE")); v != 0 {
 		t.Errorf("基线不应累加 counter, got %v", v)
 	}
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j1", "SUCCESS")); v != 0 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j1", "SUCCESS")); v != 0 {
 		t.Errorf("基线不应累加 counter, got %v", v)
 	}
-	if v := testutil.ToFloat64(m.JobConsecutiveFailures.WithLabelValues("j1")); v != 0 {
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, "j1")); v != 0 {
 		t.Errorf("基线 consecutive_failures 应为 0, got %v", v)
 	}
 	// 基线 last_success = 最近 SUCCESS 时间（秒）。
-	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.WithLabelValues("j1")); v != 1698000000 {
+	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.Vec().WithLabelValues(testCommunity, "j1")); v != 1698000000 {
 		t.Errorf("基线 last_success ts = %v, want 1698000000", v)
 	}
 	st := col.State().Get("j1")
@@ -134,16 +147,16 @@ func TestBaselineDoesNotAccumulateCounters(t *testing.T) {
 		t.Errorf("基线水位线 = %d, want 3", st.LastSeenBuild)
 	}
 	// 自监控。
-	if v := testutil.ToFloat64(m.ExporterScrapeSuccess); v != 1 {
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 1 {
 		t.Errorf("scrape_success = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(m.ExecutorBusy); v != 2 {
+	if v := testutil.ToFloat64(m.ExecutorBusy.Vec().WithLabelValues(testCommunity)); v != 2 {
 		t.Errorf("executor_busy = %v, want 2", v)
 	}
-	if v := testutil.ToFloat64(m.QueueLength); v != 1 {
+	if v := testutil.ToFloat64(m.QueueLength.Vec().WithLabelValues(testCommunity)); v != 1 {
 		t.Errorf("queue_length = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(m.AgentOnline.WithLabelValues("a0")); v != 1 {
+	if v := testutil.ToFloat64(m.AgentOnline.Vec().WithLabelValues(testCommunity, "a0")); v != 1 {
 		t.Errorf("agent_online a0 = %v, want 1", v)
 	}
 }
@@ -165,16 +178,16 @@ func TestIncrementalAccumulatesAndConsecutiveRule(t *testing.T) {
 	)
 	col.RefreshOnce(context.Background())
 
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j1", "FAILURE")); v != 3 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j1", "FAILURE")); v != 3 {
 		t.Errorf("FAILURE counter = %v, want 3", v)
 	}
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j1", "SUCCESS")); v != 1 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j1", "SUCCESS")); v != 1 {
 		t.Errorf("SUCCESS counter = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(m.JobConsecutiveFailures.WithLabelValues("j1")); v != 1 {
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, "j1")); v != 1 {
 		t.Errorf("consecutive_failures = %v, want 1（末尾 F 在 S 之后）", v)
 	}
-	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.WithLabelValues("j1")); v != 1698000050 {
+	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.Vec().WithLabelValues(testCommunity, "j1")); v != 1698000050 {
 		t.Errorf("last_success ts = %v, want 1698000050", v)
 	}
 	st := col.State().Get("j1")
@@ -202,13 +215,13 @@ func TestConsecutiveNeutralForAbortedUnstable(t *testing.T) {
 	)
 	col.RefreshOnce(context.Background())
 
-	if v := testutil.ToFloat64(m.JobConsecutiveFailures.WithLabelValues("j")); v != 1 {
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, "j")); v != 1 {
 		t.Errorf("ABORTED/UNSTABLE 中性后 consecutive = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "ABORTED")); v != 1 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j", "ABORTED")); v != 1 {
 		t.Errorf("ABORTED counter = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "UNSTABLE")); v != 1 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j", "UNSTABLE")); v != 1 {
 		t.Errorf("UNSTABLE counter = %v, want 1", v)
 	}
 }
@@ -231,7 +244,7 @@ func TestUnknownResultAdvancesWaterlineNoCounter(t *testing.T) {
 	col.RefreshOnce(context.Background())
 
 	// NOT_BUILT 不计入 counter，但水位线推进到 3；FAILURE +1。
-	if v := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "FAILURE")); v != 1 {
+	if v := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j", "FAILURE")); v != 1 {
 		t.Errorf("FAILURE counter = %v, want 1", v)
 	}
 	st := col.State().Get("j")
@@ -277,7 +290,7 @@ func TestWaterlineNeverRegresses(t *testing.T) {
 	if st.LastSeenBuild != 3 {
 		t.Fatalf("基线水位线 = %d, want 3", st.LastSeenBuild)
 	}
-	failureBefore := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "FAILURE"))
+	failureBefore := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j", "FAILURE"))
 
 	// 第二次：Jenkins 返回不全，只回 [1,2]（全部 number ≤ last_seen），模拟构建删除/API 间歇。
 	src.buildsByJob["j"] = []jenkins.Build{
@@ -291,7 +304,7 @@ func TestWaterlineNeverRegresses(t *testing.T) {
 		t.Errorf("水位线回退 = %d, want 3（水位线只进不退）", st.LastSeenBuild)
 	}
 	// 已计数过的构建不应重复 Inc。
-	failureAfter := testutil.ToFloat64(m.BuildResultTotal.WithLabelValues("j", "FAILURE"))
+	failureAfter := testutil.ToFloat64(m.BuildResultTotal.Vec().WithLabelValues(testCommunity, "j", "FAILURE"))
 	if failureAfter != failureBefore {
 		t.Errorf("回退刷新导致重复计数: FAILURE counter %v -> %v", failureBefore, failureAfter)
 	}
@@ -313,7 +326,7 @@ func TestEmptyBuildHistoryBaseline(t *testing.T) {
 	if st.LastSeenBuild != 0 {
 		t.Errorf("空历史水位线 = %d, want 0", st.LastSeenBuild)
 	}
-	if v := testutil.ToFloat64(m.AgentOnline.WithLabelValues("a0")); v != 0 {
+	if v := testutil.ToFloat64(m.AgentOnline.Vec().WithLabelValues(testCommunity, "a0")); v != 0 {
 		t.Errorf("offline agent 应为 0, got %v", v)
 	}
 }
@@ -329,7 +342,7 @@ func TestJobsFetchFailureSetsScrapeFail(t *testing.T) {
 	if ok {
 		t.Fatal("job 列表失败应整体失败")
 	}
-	if v := testutil.ToFloat64(m.ExporterScrapeSuccess); v != 0 {
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
 	}
 }
@@ -346,7 +359,7 @@ func TestAllJobsFailSetsScrapeFail(t *testing.T) {
 	if ok {
 		t.Fatal("全部 job 失败应整体失败")
 	}
-	if v := testutil.ToFloat64(m.ExporterScrapeSuccess); v != 0 {
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
 	}
 }
@@ -367,7 +380,7 @@ func TestOneJobOKOthersFailScrapeSuccess(t *testing.T) {
 	if !ok {
 		t.Fatal("部分 job 成功应整体成功")
 	}
-	if v := testutil.ToFloat64(m.ExporterScrapeSuccess); v != 1 {
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 1 {
 		t.Errorf("scrape_success = %v, want 1", v)
 	}
 }
@@ -447,6 +460,48 @@ func TestMetricsExposedWithHelpAndType(t *testing.T) {
 	}
 }
 
+func TestMetricsCarryObsLabels(t *testing.T) {
+	src := &mockSource{
+		topJobs:     []jenkins.Job{{Name: "j1", Class: "hudson.model.FreeStyleProject"}},
+		buildsByJob: map[string][]jenkins.Build{"j1": baselineBuilds()},
+		computers:   []jenkins.Computer{{DisplayName: "a0"}},
+		queue:       []jenkins.QueueItem{{ID: 1}},
+	}
+	col, reg, _ := newCollector(t, src, []string{"j1"}, nil)
+	col.RefreshOnce(context.Background())
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	checked := 0
+	for _, mf := range mfs {
+		if !strings.HasPrefix(mf.GetName(), "jenkins_") {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range metric.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			checked++
+			// obs-sdk 自动附加的部署级 label 必须齐全且非空（空值会让采集侧静默漏数）。
+			if labels["service"] != "jenkins-exporter" {
+				t.Errorf("%s service label = %q", mf.GetName(), labels["service"])
+			}
+			if labels["community"] != testCommunity {
+				t.Errorf("%s community label = %q", mf.GetName(), labels["community"])
+			}
+			if labels["env"] == "" || labels["instance"] == "" {
+				t.Errorf("%s 缺少 env/instance label: %v", mf.GetName(), labels)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("没有任何 jenkins_* 序列，label 断言形同虚设")
+	}
+}
+
 func TestMissedBuildsWarn(t *testing.T) {
 	// 构造 100 条全部 > last_seen（基线后）。
 	var builds []jenkins.Build
@@ -493,7 +548,7 @@ func TestFolderTraversalWithWhitelist(t *testing.T) {
 	if !ok {
 		t.Fatal("folder 下钻应成功")
 	}
-	if v := testutil.ToFloat64(m.JobConsecutiveFailures.WithLabelValues("gate/leaf")); v != 0 {
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, "gate/leaf")); v != 0 {
 		t.Errorf("gate/leaf 基线 consecutive = %v, want 0", v)
 	}
 }
@@ -501,8 +556,8 @@ func TestFolderTraversalWithWhitelist(t *testing.T) {
 func TestStatePersistedAcrossCollectorInstances(t *testing.T) {
 	dir := t.TempDir()
 	p := dir + "/state.json"
-	reg := prometheus.NewRegistry()
-	m := NewMetrics(reg)
+	om := newTestMetrics()
+	m := NewMetrics(om)
 	st := state.New()
 	col := NewCollector(&mockSource{
 		topJobs:     []jenkins.Job{{Name: "j", Class: "hudson.model.FreeStyleProject"}},
@@ -535,7 +590,7 @@ func TestContextCancelledRefreshFails(t *testing.T) {
 	if ok := col.RefreshOnce(ctx); ok {
 		t.Fatal("ctx 取消应失败")
 	}
-	if v := testutil.ToFloat64(m.ExporterScrapeSuccess); v != 0 {
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
 	}
 }

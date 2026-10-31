@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,11 +14,14 @@ import (
 	"github.com/opensourceways/jenkins-exporter/internal/server"
 	"github.com/opensourceways/jenkins-exporter/internal/state"
 
-	"github.com/prometheus/client_golang/prometheus"
+	obslog "github.com/opensourceways/obs-sdk/go/log"
+	obsmetrics "github.com/opensourceways/obs-sdk/go/metrics"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// 日志与指标都经 obs-sdk 装配：service 显式指定，env/instance/community 由 OBS_* 注入。
+	obslog.Init(obslog.Config{Service: "jenkins-exporter"})
+	log := obslog.Default()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -27,8 +29,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg := prometheus.NewRegistry()
-	metrics := collector.NewMetrics(reg)
+	om := obsmetrics.New(obsmetrics.Config{Service: "jenkins-exporter"})
+	metrics := collector.NewMetrics(om)
 
 	st, existed, err := state.Load(cfg.StatePath)
 	if err != nil {
@@ -55,7 +57,7 @@ func main() {
 
 	go col.Run(ctx)
 
-	srv := server.New(cfg.ListenAddr, reg, log)
+	srv := server.New(cfg.ListenAddr, om.Handler(), log)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Error("http server 退出", "err", err.Error())
 		os.Exit(1)

@@ -64,6 +64,8 @@ curl -s localhost:9300/healthz   # ok
 
 **硬约束：** build number 不作为标签；首次启动只建基线、不产生历史计数。
 
+日志与指标均经 [obs-sdk](https://github.com/opensourceways/obs-sdk) 装配：日志为单行扁平 JSON 写 stdout（`time/level/msg/service/env/instance/community` + 业务字段）；每条指标序列自动附加 `service` / `env` / `instance` / `community` 常驻标签。`service` 固定为 `jenkins-exporter`，`env` / `community` 由部署注入 `OBS_ENV` / `OBS_COMMUNITY`（未注入时回落 `unknown`），`instance` 默认取 Pod 名（不注入 `OBS_INSTANCE`）。
+
 ## 本地调试
 
 ### testdata 离线跑

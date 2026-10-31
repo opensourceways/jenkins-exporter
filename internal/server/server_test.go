@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func testLog() *slog.Logger {
@@ -19,7 +20,7 @@ func testLog() *slog.Logger {
 
 func TestHealthz(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	s := New(":0", reg, testLog())
+	s := New(":0", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), testLog())
 	rw := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rw.Code != http.StatusOK {
@@ -36,7 +37,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: "jenkins_test_metric", Help: "测试"})
 	reg.MustRegister(g)
 	g.Set(42)
-	s := New(":0", reg, testLog())
+	s := New(":0", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), testLog())
 	rw := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rw.Code != http.StatusOK {
@@ -53,7 +54,7 @@ func TestMetricsEndpoint(t *testing.T) {
 
 func TestListenAndServeShutdown(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	s := New("127.0.0.1:0", reg, testLog())
+	s := New("127.0.0.1:0", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), testLog())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.ListenAndServe(ctx) }()
