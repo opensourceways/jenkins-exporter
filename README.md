@@ -37,7 +37,9 @@ curl -s localhost:9300/healthz   # ok
 | Jenkins 用户 | `JENKINS_USER` | — | 在线必填 | Basic 认证用户名 |
 | token 文件 | `JENKINS_TOKEN_FILE` | `/vault/secrets/jenkins-token` | 在线必填 | 文件卷挂载；进程读文件，不打日志 |
 | 刷新间隔 | `SCRAPE_INTERVAL` | `60s` | 否 | 后台刷新周期 |
-| job 白名单 | `JOB_WHITELIST` | — | 是 | 逗号分隔的 job 全路径，如 `folder/sub/job1,job2` |
+| job 白名单 | `JOB_WHITELIST` | — | 否* | 逗号分隔的 job 全路径，如 `folder/sub/job1,job2`；逐 job 采集构建历史 |
+| folder 白名单 | `FOLDER_WHITELIST` | — | 否* | 逗号分隔的 folder 全路径，如 `multiarch/src-openeuler/x86-64`；按 folder 聚合采集，不展开 per-job series |
+| 停滞阈值 | `STALE_THRESHOLD` | `24h` | 否 | 超过该时长未构建的 job 计入 `jenkins_folder_stale_jobs` |
 | 状态文件 | `STATE_PATH` | `/data/state.json` | 否 | PVC 上水位线文件 |
 | 监听地址 | `LISTEN_ADDR` | `:9300` | 否 | /metrics 监听 |
 | 单请求超时 | `HTTP_TIMEOUT` | `10s` | 否 | 单个 Jenkins 请求超时 |
@@ -45,8 +47,10 @@ curl -s localhost:9300/healthz   # ok
 | fixture 目录 | `FIXTURE_DIR` | `testdata` | 否 | 离线 fixture 目录 |
 
 > token 轮转：client 按文件 mtime 变化重读，无需重启。日志只打印 `len` 与 `sha256[:8]`，绝不打印原值。
+>
+> \* `JOB_WHITELIST` 与 `FOLDER_WHITELIST` 至少配置一个；两者都配置时两套指标同时输出。
 
-## 指标（7 + 2）
+## 指标（7 + 4 + 2）
 
 | 指标 | 类型 | 标签 | 说明 |
 | --- | --- | --- | --- |
@@ -57,6 +61,10 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_agent_online` | gauge | `agent` | 1 在线，0 离线（temporarilyOffline 不影响 online 判定） |
 | `jenkins_executor_busy` | gauge | 无 | 全局忙碌 executor 数 |
 | `jenkins_queue_length` | gauge | 无 | 构建队列长度 |
+| `jenkins_folder_jobs_total` | gauge | `folder` | folder 下直接子 job 总数（不含子 folder） |
+| `jenkins_folder_jobs_by_color` | gauge | `folder`, `color` | 按 Jenkins color 分类的 job 数；`_anime` 后缀已归一化，未知值归 `unknown` |
+| `jenkins_folder_last_build_age_seconds` | gauge | `folder` | folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建 |
+| `jenkins_folder_stale_jobs` | gauge | `folder` | 超过 `STALE_THRESHOLD` 未构建（或从未构建）的 job 数 |
 | `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：最近一次刷新是否成功 |
 | `jenkins_exporter_last_refresh_timestamp_seconds` | gauge | 无 | 自监控：最近一次刷新完成时间（秒） |
 

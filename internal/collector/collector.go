@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/opensourceways/jenkins-exporter/internal/jenkins"
@@ -17,32 +18,38 @@ const maxBackoff = 5 * time.Minute
 
 // Collector 负责刷新循环：拉取 → 解析 → delta 计算 → 更新指标 → 持久化 state。
 type Collector struct {
-	src            jenkins.DataSource
-	whitelist      map[string]bool
-	whitelistOrder []string
-	state          *state.State
-	statePath      string
-	metrics        *Metrics
-	scrapeInterval time.Duration
-	log            *slog.Logger
+	src             jenkins.DataSource
+	whitelist       map[string]bool
+	whitelistOrder  []string
+	folderWhitelist []string
+	staleThreshold  time.Duration
+	state           *state.State
+	statePath       string
+	metrics         *Metrics
+	scrapeInterval  time.Duration
+	log             *slog.Logger
 }
 
 // NewCollector 构造 Collector。state 由外部加载（可为基线空 State）。
-func NewCollector(src jenkins.DataSource, whitelist []string, st *state.State, statePath string, m *Metrics, scrapeInterval time.Duration, log *slog.Logger) *Collector {
+// whitelist 为精确 job 全路径；folderWhitelist 为按 folder 聚合采集的 folder 全路径。
+func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, st *state.State, statePath string, m *Metrics, scrapeInterval, staleThreshold time.Duration, log *slog.Logger) *Collector {
 	wl := make(map[string]bool, len(whitelist))
 	for _, j := range whitelist {
 		wl[j] = true
 	}
 	m.InitJobSeries(whitelist)
+	m.InitFolderSeries(folderWhitelist)
 	return &Collector{
-		src:            src,
-		whitelist:      wl,
-		whitelistOrder: whitelist,
-		state:          st,
-		statePath:      statePath,
-		metrics:        m,
-		scrapeInterval: scrapeInterval,
-		log:            log,
+		src:             src,
+		whitelist:       wl,
+		whitelistOrder:  whitelist,
+		folderWhitelist: folderWhitelist,
+		staleThreshold:  staleThreshold,
+		state:           st,
+		statePath:       statePath,
+		metrics:         m,
+		scrapeInterval:  scrapeInterval,
+		log:             log,
 	}
 }
 
@@ -89,31 +96,40 @@ func (c *Collector) backoff(failures int) time.Duration {
 }
 
 // RefreshOnce 执行一次完整刷新，返回是否整体成功。
-// 整体成功 = job 列表、computer、queue 拉取均成功，且（有白名单时）至少一个 job 构建拉取成功。
+// 整体成功 = job 列表（配置了精确白名单时）、folder 聚合、computer、queue 拉取均成功，
+// 且（有精确白名单时）至少一个 job 构建拉取成功。
 func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	if err := ctx.Err(); err != nil {
 		c.finalize(false)
 		return false
 	}
 
-	leaves, err := jenkins.EnumerateLeafJobs(ctx, c.src, "")
-	jobsOK := err == nil
-	if err != nil {
-		c.log.Warn("拉取 job 列表失败", "err", err.Error())
-	}
-	targets := c.filterWhitelist(leaves)
-
-	jobBuilds := make(map[string][]jenkins.Build, len(targets))
+	// 精确 job 路径：仅当配置了 JOB_WHITELIST 时才做全量递归枚举，避免无谓开销。
+	jobsOK := true
+	var targets []string
+	jobBuilds := make(map[string][]jenkins.Build)
 	jobOK := 0
-	for _, job := range targets {
-		builds, berr := c.src.Builds(ctx, job)
-		if berr != nil {
-			c.log.Warn("拉取 job 构建失败，跳过", "job", job, "err", berr.Error())
-			continue
+	if len(c.whitelist) > 0 {
+		leaves, err := jenkins.EnumerateLeafJobs(ctx, c.src, "")
+		jobsOK = err == nil
+		if err != nil {
+			c.log.Warn("拉取 job 列表失败", "err", err.Error())
 		}
-		jobBuilds[job] = builds
-		jobOK++
+		targets = c.filterWhitelist(leaves)
+		jobBuilds = make(map[string][]jenkins.Build, len(targets))
+		for _, job := range targets {
+			builds, berr := c.src.Builds(ctx, job)
+			if berr != nil {
+				c.log.Warn("拉取 job 构建失败，跳过", "job", job, "err", berr.Error())
+				continue
+			}
+			jobBuilds[job] = builds
+			jobOK++
+		}
 	}
+
+	// folder 聚合路径：每个配置的 folder 一次请求，内存聚合，不产生 per-job series。
+	foldersOK := c.refreshFolders(ctx)
 
 	computers, cerr := c.src.Computers(ctx)
 	computersOK := cerr == nil
@@ -127,11 +143,80 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 		c.log.Warn("拉取 queue 失败", "err", qerr.Error())
 	}
 
-	success := jobsOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
+	success := jobsOK && foldersOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
 
 	c.processAndPersist(jobBuilds, computers, computersOK, items, queueOK)
 	c.finalize(success)
 	return success
+}
+
+// refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。返回是否全部 folder 成功。
+func (c *Collector) refreshFolders(ctx context.Context) bool {
+	if len(c.folderWhitelist) == 0 {
+		return true
+	}
+	ok := true
+	now := time.Now()
+	for _, folder := range c.folderWhitelist {
+		jobs, err := c.src.FolderJobs(ctx, folder)
+		if err != nil {
+			c.log.Warn("拉取 folder job 摘要失败", "folder", folder, "err", err.Error())
+			ok = false
+			continue
+		}
+		c.aggregateFolder(folder, jobs, now)
+	}
+	return ok
+}
+
+// aggregateFolder 把 folder 直接子 job 的状态聚合为 folder 级指标。
+// 只统计叶子 job；子 folder 本身不计数（需覆盖时显式列入 FOLDER_WHITELIST）。
+func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.Time) {
+	counts := make(map[string]int, len(JenkinsColorValues))
+	total, stale := 0, 0
+	var newest int64
+	for _, j := range jobs {
+		if jenkins.IsFolderClass(j.Class) {
+			continue
+		}
+		total++
+		counts[normalizeColor(j.Color)]++
+		if j.LastBuild != nil {
+			if j.LastBuild.Timestamp > newest {
+				newest = j.LastBuild.Timestamp
+			}
+			if now.Sub(time.UnixMilli(j.LastBuild.Timestamp)) <= c.staleThreshold {
+				continue
+			}
+		}
+		// 从未构建，或最近一次构建早于停滞阈值。
+		stale++
+	}
+
+	c.metrics.FolderJobsTotal.Set(float64(total), folder)
+	for _, color := range JenkinsColorValues {
+		c.metrics.FolderJobsByColor.Set(float64(counts[color]), folder, color)
+	}
+	if newest > 0 {
+		c.metrics.FolderLastBuildAge.Set(now.Sub(time.UnixMilli(newest)).Seconds(), folder)
+	} else {
+		c.metrics.FolderLastBuildAge.Set(0, folder)
+	}
+	c.metrics.FolderStaleJobs.Set(float64(stale), folder)
+}
+
+// normalizeColor 归一化 Jenkins color：去掉 _anime（构建中）后缀，未知值归为 unknown。
+func normalizeColor(color string) string {
+	if color == "" {
+		return "unknown"
+	}
+	color = strings.TrimSuffix(color, "_anime")
+	for _, c := range JenkinsColorValues {
+		if c == color {
+			return color
+		}
+	}
+	return "unknown"
 }
 
 // processAndPersist 执行 delta 计算、指标更新与 state 持久化。

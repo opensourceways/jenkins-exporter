@@ -7,10 +7,23 @@ import (
 )
 
 // Job 表示 Jenkins 顶层或 folder 内的 job 条目。
+// Color 与 lastBuild 系列字段仅在 FolderJobs 拉取时填充，Jobs 保持轻量。
 type Job struct {
 	Name  string `json:"name"`
 	Class string `json:"_class"`
 	URL   string `json:"url"`
+
+	Color               string        `json:"color"`
+	LastBuild           *BuildSummary `json:"lastBuild"`
+	LastSuccessfulBuild *BuildSummary `json:"lastSuccessfulBuild"`
+}
+
+// BuildSummary 是 folder 列表接口返回的构建摘要，字段少于 Build（不含 builtOn）。
+type BuildSummary struct {
+	Number    int     `json:"number"`
+	Result    *string `json:"result"`
+	Duration  int64   `json:"duration"`
+	Timestamp int64   `json:"timestamp"`
 }
 
 // JobsResponse 对应 GET /api/json?tree=jobs[name,_class,url]。
@@ -64,6 +77,8 @@ type QueueResponse struct {
 // DataSource 抽象 Jenkins 四类只读数据拉取，便于用 httptest 桩与离线 fixture 复用。
 type DataSource interface {
 	Jobs(ctx context.Context, path string) ([]Job, error)
+	// FolderJobs 拉取 folder 直接子 job 的摘要（含 color 与最近构建），用于聚合，不逐 job 展开。
+	FolderJobs(ctx context.Context, path string) ([]Job, error)
 	Builds(ctx context.Context, jobPath string) ([]Build, error)
 	Computers(ctx context.Context) ([]Computer, error)
 	Queue(ctx context.Context) ([]QueueItem, error)
