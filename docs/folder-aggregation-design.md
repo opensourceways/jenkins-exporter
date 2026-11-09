@@ -107,14 +107,22 @@ RefreshOnce
 
 ### 4.3 指标定义
 
-新增 4 个 folder 级指标（全部为 gauge，快照型，无需 state 水位线）：
+新增 5 个 folder 级指标（全部为 gauge，快照型，无需 state 水位线）：
 
 | 指标 | 标签 | 含义 |
 |---|---|---|
 | `jenkins_folder_jobs_total` | `folder` | 该 folder 下的 job 总数 |
 | `jenkins_folder_jobs_by_color` | `folder`, `color` | 按 Jenkins color 分类的 job 数 |
 | `jenkins_folder_last_build_age_seconds` | `folder` | 该 folder 内最近一次构建距今秒数（0 表示无构建） |
+| `jenkins_folder_last_success_age_seconds` | `folder` | 该 folder 内最近一次**成功**构建距今秒数（0 表示从未成功）。与上一条配合可识别「一直在跑但一直失败」的 job——这类 job 的 last_build_age 很小，看起来健康 |
 | `jenkins_folder_stale_jobs` | `folder` | 超过 `STALE_THRESHOLD` 未构建的 job 数 |
+
+同时补齐 2 个「数据已在手但未输出」的全局指标（零新增请求）：
+
+| 指标 | 标签 | 含义 |
+|---|---|---|
+| `jenkins_executor_total` | 无 | 各节点 `numExecutors` 之和，与 `executor_busy` 相除即饱和度 |
+| `jenkins_queue_oldest_wait_seconds` | 无 | 队列中最早入队项（`inQueueSince`）已等待秒数；队列为空时为 0 |
 
 `color` 取值与语义（Jenkins 原生）：
 
@@ -127,7 +135,42 @@ RefreshOnce
 | `notbuilt` | 从未构建 |
 | `disabled` | 已禁用 |
 
-系列数估算：folder 数（约 4）× color（约 6）+ 2 = **约 26 条**，对比 per-job 方案 8 万条。
+series 数估算：4 个 folder ×（1 个总数 + 7 个 color + 3 个 age/stale）= **44 条**，对比 per-job 方案 8 万条。
+
+### 4.4 失败 job 定位告警（日志方案）
+
+folder 聚合刻意不暴露 job 身份，因此无法通过指标告警到具体 job。补一条**日志侧**的通道，不新增任何 Prometheus series、不新增任何 API 请求：
+
+**状态机**（持久化在 state.json）：
+
+| 字段 | 含义 |
+|---|---|
+| `red_seen` | 上一轮处于 red 的 job 全路径集合 |
+| `alerted` | 已告警且仍为 red 的 job 集合 |
+
+每轮 folder 聚合完成后：
+
+```
+current   = 本轮所有 color=red 的 job 全路径
+toAlert   = (current ∩ red_seen) - alerted     // 连续两轮 red 且未告警过
+alerted   = (alerted ∩ current) ∪ toAlert      // 仍为 red 的保留，恢复的移出
+red_seen  = current
+```
+
+规则：
+
+- **连续两轮 red 才告警** → 过滤单轮抖动（flaky job）
+- **同一故障只告警一次** → 恢复为绿前不重复；恢复后再红重新走两轮判定
+- **每轮上限 50 条** → 超出汇总一条「另有 N 个」，避免故障风暴刷屏
+- **folder 拉取失败时跳过状态机** → 避免把「没采到」误判为「已恢复」
+
+日志：
+
+```json
+{"level":"WARN","msg":"job 连续两轮失败","job":"multiarch/src-openeuler/x86-64/xxx"}
+```
+
+Loki 直接消费该日志做告警，通知可带 job 名。成本：0 次 API 请求、<1% CPU、state 增加约几十 KB / 轮。
 
 **与需求条目的映射**：
 

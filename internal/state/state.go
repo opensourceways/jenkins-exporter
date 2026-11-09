@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // JobState 是单个 job 的增量水位线与计数。
@@ -19,6 +20,11 @@ type JobState struct {
 type State struct {
 	Version int                  `json:"version"`
 	Jobs    map[string]*JobState `json:"jobs"`
+
+	// RedSeen 是上一轮处于 red 的 job 全路径，用于「连续两轮 red」判定。
+	RedSeen []string `json:"red_seen,omitempty"`
+	// Alerted 是已告警过、且仍处于 red 的 job，避免同一故障每轮重复告警。
+	Alerted []string `json:"alerted,omitempty"`
 }
 
 // CurrentVersion 是当前 state 文件版本。
@@ -70,6 +76,37 @@ func (s *State) Save(path string) error {
 		return fmt.Errorf("rename state 文件失败: %w", err)
 	}
 	return nil
+}
+
+// RedMaps 把持久化的 red 集合转为 map，便于 collector 做差集。
+func (s *State) RedMaps() (seen, alerted map[string]bool) {
+	seen = make(map[string]bool, len(s.RedSeen))
+	for _, j := range s.RedSeen {
+		seen[j] = true
+	}
+	alerted = make(map[string]bool, len(s.Alerted))
+	for _, j := range s.Alerted {
+		alerted[j] = true
+	}
+	return seen, alerted
+}
+
+// SetRedState 写回 red 集合。排序后写入，保证同内容产生相同文件（便于 diff 与测试）。
+func (s *State) SetRedState(seen, alerted map[string]bool) {
+	s.RedSeen = sortedKeys(seen)
+	s.Alerted = sortedKeys(alerted)
+}
+
+func sortedKeys(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Get 返回 job 的状态，不存在返回 nil。

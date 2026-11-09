@@ -28,7 +28,15 @@ type Collector struct {
 	metrics         *Metrics
 	scrapeInterval  time.Duration
 	log             *slog.Logger
+
+	// redSeen 是上一轮处于 red 的 job 全路径；alerted 是已告警且仍为 red 的 job。
+	// 两者配合实现「连续两轮 red 才告警，同一故障只告警一次」。
+	redSeen map[string]bool
+	alerted map[string]bool
 }
+
+// maxRedAlertsPerRound 限制单轮输出的失败 job 告警条数，避免大规模故障时刷爆日志。
+const maxRedAlertsPerRound = 50
 
 // NewCollector 构造 Collector。state 由外部加载（可为基线空 State）。
 // whitelist 为精确 job 全路径；folderWhitelist 为按 folder 聚合采集的 folder 全路径。
@@ -39,6 +47,7 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 	}
 	m.InitJobSeries(whitelist)
 	m.InitFolderSeries(folderWhitelist)
+	redSeen, alerted := st.RedMaps()
 	return &Collector{
 		src:             src,
 		whitelist:       wl,
@@ -50,6 +59,8 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 		metrics:         m,
 		scrapeInterval:  scrapeInterval,
 		log:             log,
+		redSeen:         redSeen,
+		alerted:         alerted,
 	}
 }
 
@@ -129,7 +140,11 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	}
 
 	// folder 聚合路径：每个配置的 folder 一次请求，内存聚合，不产生 per-job series。
-	foldersOK := c.refreshFolders(ctx)
+	foldersOK, currentRed := c.refreshFolders(ctx)
+	// 只有全部 folder 都拉取成功时才推进 red 状态机，否则会把抓取失败的 folder 误判为「已恢复」。
+	if foldersOK && len(c.folderWhitelist) > 0 {
+		c.processRedTransitions(currentRed)
+	}
 
 	computers, cerr := c.src.Computers(ctx)
 	computersOK := cerr == nil
@@ -150,10 +165,12 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	return success
 }
 
-// refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。返回是否全部 folder 成功。
-func (c *Collector) refreshFolders(ctx context.Context) bool {
+// refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。
+// 返回是否全部 folder 成功，以及本轮所有 red job 的全路径集合（供失败告警使用）。
+func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool) {
+	red := make(map[string]bool)
 	if len(c.folderWhitelist) == 0 {
-		return true
+		return true, red
 	}
 	ok := true
 	now := time.Now()
@@ -165,8 +182,52 @@ func (c *Collector) refreshFolders(ctx context.Context) bool {
 			continue
 		}
 		c.aggregateFolder(folder, jobs, now)
+		for _, j := range jobs {
+			if jenkins.IsFolderClass(j.Class) {
+				continue
+			}
+			if normalizeColor(j.Color) == "red" {
+				red[folder+"/"+j.Name] = true
+			}
+		}
 	}
-	return ok
+	return ok, red
+}
+
+// processRedTransitions 推进失败 job 状态机并输出告警日志。
+// 规则：连续两轮 red 才告警；同一 job 在恢复为绿之前只告警一次。
+func (c *Collector) processRedTransitions(current map[string]bool) {
+	var toAlert []string
+	for job := range current {
+		if c.redSeen[job] && !c.alerted[job] {
+			toAlert = append(toAlert, job)
+		}
+	}
+	sort.Strings(toAlert)
+
+	// 已恢复的 job 移出告警集合，下次再失败可重新告警。
+	for job := range c.alerted {
+		if !current[job] {
+			delete(c.alerted, job)
+		}
+	}
+	for _, job := range toAlert {
+		c.alerted[job] = true
+	}
+
+	shown := toAlert
+	if len(shown) > maxRedAlertsPerRound {
+		shown = shown[:maxRedAlertsPerRound]
+	}
+	for _, job := range shown {
+		c.log.Warn("job 连续两轮失败", "job", job)
+	}
+	if rest := len(toAlert) - len(shown); rest > 0 {
+		c.log.Warn("本轮另有 job 连续失败，已省略", "omitted", rest)
+	}
+
+	c.redSeen = current
+	c.state.SetRedState(c.redSeen, c.alerted)
 }
 
 // aggregateFolder 把 folder 直接子 job 的状态聚合为 folder 级指标。
@@ -174,13 +235,16 @@ func (c *Collector) refreshFolders(ctx context.Context) bool {
 func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.Time) {
 	counts := make(map[string]int, len(JenkinsColorValues))
 	total, stale := 0, 0
-	var newest int64
+	var newest, newestSuccess int64
 	for _, j := range jobs {
 		if jenkins.IsFolderClass(j.Class) {
 			continue
 		}
 		total++
 		counts[normalizeColor(j.Color)]++
+		if j.LastSuccessfulBuild != nil && j.LastSuccessfulBuild.Timestamp > newestSuccess {
+			newestSuccess = j.LastSuccessfulBuild.Timestamp
+		}
 		if j.LastBuild != nil {
 			if j.LastBuild.Timestamp > newest {
 				newest = j.LastBuild.Timestamp
@@ -201,6 +265,11 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 		c.metrics.FolderLastBuildAge.Set(now.Sub(time.UnixMilli(newest)).Seconds(), folder)
 	} else {
 		c.metrics.FolderLastBuildAge.Set(0, folder)
+	}
+	if newestSuccess > 0 {
+		c.metrics.FolderLastSuccessAge.Set(now.Sub(time.UnixMilli(newestSuccess)).Seconds(), folder)
+	} else {
+		c.metrics.FolderLastSuccessAge.Set(0, folder)
 	}
 	c.metrics.FolderStaleJobs.Set(float64(stale), folder)
 }
@@ -229,6 +298,7 @@ func (c *Collector) processAndPersist(jobBuilds map[string][]jenkins.Build, comp
 	}
 	if queueOK {
 		c.metrics.QueueLength.Set(float64(len(items)))
+		c.metrics.QueueOldestWait.Set(oldestQueueWaitSeconds(items, time.Now()))
 	}
 	if err := c.state.Save(c.statePath); err != nil {
 		c.log.Error("持久化 state 失败", "err", err.Error())
@@ -346,7 +416,7 @@ func (c *Collector) applyIncremental(job string, st *state.JobState, allBuilds [
 }
 
 func (c *Collector) updateComputers(comps []jenkins.Computer) {
-	var busy int
+	var busy, total int
 	for _, comp := range comps {
 		v := 0.0
 		if !comp.Offline {
@@ -354,8 +424,28 @@ func (c *Collector) updateComputers(comps []jenkins.Computer) {
 		}
 		c.metrics.AgentOnline.Set(v, comp.DisplayName)
 		busy += comp.BusyExecutors
+		total += comp.NumExecutors
 	}
 	c.metrics.ExecutorBusy.Set(float64(busy))
+	c.metrics.ExecutorTotal.Set(float64(total))
+}
+
+// oldestQueueWaitSeconds 返回队列中最早入队项已等待的秒数；队列为空或时间戳异常时返回 0。
+func oldestQueueWaitSeconds(items []jenkins.QueueItem, now time.Time) float64 {
+	var oldest int64
+	for _, it := range items {
+		if it.InQueueSince > 0 && (oldest == 0 || it.InQueueSince < oldest) {
+			oldest = it.InQueueSince
+		}
+	}
+	if oldest == 0 {
+		return 0
+	}
+	wait := now.Sub(time.UnixMilli(oldest)).Seconds()
+	if wait < 0 {
+		return 0
+	}
+	return wait
 }
 
 // finishedBuilds 过滤出 result 非 nil（已完成）的构建。

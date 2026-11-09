@@ -17,15 +17,18 @@ type Metrics struct {
 	JobLastSuccessTimestamp *obsmetrics.GaugeVec
 	AgentOnline             *obsmetrics.GaugeVec
 	ExecutorBusy            *obsmetrics.GaugeVec
+	ExecutorTotal           *obsmetrics.GaugeVec
 	QueueLength             *obsmetrics.GaugeVec
+	QueueOldestWait         *obsmetrics.GaugeVec
 	ExporterScrapeSuccess   *obsmetrics.GaugeVec
 	ExporterLastRefreshTime *obsmetrics.GaugeVec
 
 	// folder 级聚合指标：覆盖全量 job 的状态分布，不产生 per-job series。
-	FolderJobsTotal    *obsmetrics.GaugeVec
-	FolderJobsByColor  *obsmetrics.GaugeVec
-	FolderLastBuildAge *obsmetrics.GaugeVec
-	FolderStaleJobs    *obsmetrics.GaugeVec
+	FolderJobsTotal      *obsmetrics.GaugeVec
+	FolderJobsByColor    *obsmetrics.GaugeVec
+	FolderLastBuildAge   *obsmetrics.GaugeVec
+	FolderLastSuccessAge *obsmetrics.GaugeVec
+	FolderStaleJobs      *obsmetrics.GaugeVec
 
 	knownResults     []string
 	defaultCommunity string
@@ -51,8 +54,12 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 			"agent 是否在线：1 在线，0 离线（temporarilyOffline 不影响 online 判定）。", "agent"),
 		ExecutorBusy: om.NewGaugeVec("jenkins_executor_busy",
 			"全局忙碌 executor 数。"),
+		ExecutorTotal: om.NewGaugeVec("jenkins_executor_total",
+			"全局 executor 总数（各节点 numExecutors 之和），与 executor_busy 相除即饱和度。"),
 		QueueLength: om.NewGaugeVec("jenkins_queue_length",
 			"Jenkins 构建队列长度。"),
+		QueueOldestWait: om.NewGaugeVec("jenkins_queue_oldest_wait_seconds",
+			"队列中最早入队项的已等待秒数；队列为空时为 0。"),
 		ExporterScrapeSuccess: om.NewGaugeVec("jenkins_exporter_scrape_success",
 			"自监控：最近一次刷新是否全部成功（1 成功，0 失败）。"),
 		ExporterLastRefreshTime: om.NewGaugeVec("jenkins_exporter_last_refresh_timestamp_seconds",
@@ -63,6 +70,8 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 			"按 Jenkins color 分类的 job 数；_anime 后缀已归一化。", "folder", "color"),
 		FolderLastBuildAge: om.NewGaugeVec("jenkins_folder_last_build_age_seconds",
 			"folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建。", "folder"),
+		FolderLastSuccessAge: om.NewGaugeVec("jenkins_folder_last_success_age_seconds",
+			"folder 内最近一次成功构建距今秒数；0 表示该 folder 从未成功过。", "folder"),
 		FolderStaleJobs: om.NewGaugeVec("jenkins_folder_stale_jobs",
 			"超过 STALE_THRESHOLD 未构建（或从未构建）的 job 数。", "folder"),
 	}
@@ -76,6 +85,7 @@ func (m *Metrics) InitFolderSeries(folders []string) {
 			m.FolderJobsByColor.Vec().WithLabelValues(m.defaultCommunity, f, c).Set(0)
 		}
 		m.FolderLastBuildAge.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
+		m.FolderLastSuccessAge.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
 		m.FolderStaleJobs.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
 	}
 }
