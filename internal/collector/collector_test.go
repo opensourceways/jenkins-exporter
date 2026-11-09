@@ -1,7 +1,9 @@
 package collector
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"os"
@@ -44,9 +46,14 @@ type mockSource struct {
 	computersErr  error
 	queueErr      error
 	buildsCalls   int
+	jobsCalls     int
+
+	folderJobsByPath map[string][]jenkins.Job
+	folderJobsErr    map[string]error
 }
 
 func (m *mockSource) Jobs(_ context.Context, path string) ([]jenkins.Job, error) {
+	m.jobsCalls++
 	if m.jobsErr != nil {
 		return nil, m.jobsErr
 	}
@@ -57,6 +64,15 @@ func (m *mockSource) Jobs(_ context.Context, path string) ([]jenkins.Job, error)
 		return subs, nil
 	}
 	return nil, nil
+}
+
+func (m *mockSource) FolderJobs(_ context.Context, path string) ([]jenkins.Job, error) {
+	if m.folderJobsErr != nil {
+		if e, ok := m.folderJobsErr[path]; ok {
+			return nil, e
+		}
+	}
+	return m.folderJobsByPath[path], nil
 }
 
 func (m *mockSource) Builds(_ context.Context, job string) ([]jenkins.Build, error) {
@@ -99,13 +115,19 @@ func newTestMetrics() *obsmetrics.Metrics {
 
 func newCollector(t *testing.T, src jenkins.DataSource, whitelist []string, st *state.State) (*Collector, *prometheus.Registry, *Metrics) {
 	t.Helper()
+	return newCollectorFull(t, src, whitelist, nil, st, 24*time.Hour)
+}
+
+// newCollectorFull 允许指定 folder 白名单与停滞阈值。
+func newCollectorFull(t *testing.T, src jenkins.DataSource, whitelist, folders []string, st *state.State, stale time.Duration) (*Collector, *prometheus.Registry, *Metrics) {
+	t.Helper()
 	dir := t.TempDir()
 	om := newTestMetrics()
 	m := NewMetrics(om)
 	if st == nil {
 		st = state.New()
 	}
-	col := NewCollector(src, whitelist, st, dir+"/state.json", m, 60*time.Second, testLog())
+	col := NewCollector(src, whitelist, folders, st, dir+"/state.json", m, 60*time.Second, stale, testLog())
 	return col, om.Registry(), m
 }
 
@@ -331,16 +353,18 @@ func TestEmptyBuildHistoryBaseline(t *testing.T) {
 	}
 }
 
-func TestJobsFetchFailureSetsScrapeFail(t *testing.T) {
+func TestJobBuildsFetchFailureSetsScrapeFail(t *testing.T) {
+	// 精确白名单走直取，不再拉 job 列表；单个 job 的 builds 拉取失败即为整体失败。
 	src := &mockSource{
-		jobsErr:   jenkins.ErrUnauthorized,
+		topJobs:   []jenkins.Job{{Name: "j", Class: "hudson.model.FreeStyleProject"}},
+		buildsErr: map[string]error{"j": jenkins.ErrUnauthorized},
 		computers: []jenkins.Computer{{DisplayName: "a0"}},
 		queue:     []jenkins.QueueItem{{ID: 1}},
 	}
 	col, _, m := newCollector(t, src, []string{"j"}, nil)
 	ok := col.RefreshOnce(context.Background())
 	if ok {
-		t.Fatal("job 列表失败应整体失败")
+		t.Fatal("job 构建拉取失败应整体失败")
 	}
 	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
@@ -564,7 +588,7 @@ func TestStatePersistedAcrossCollectorInstances(t *testing.T) {
 		buildsByJob: map[string][]jenkins.Build{"j": baselineBuilds()},
 		computers:   []jenkins.Computer{{DisplayName: "a0"}},
 		queue:       nil,
-	}, []string{"j"}, st, p, m, 60*time.Second, testLog())
+	}, []string{"j"}, nil, st, p, m, 60*time.Second, 24*time.Hour, testLog())
 	col.RefreshOnce(context.Background())
 
 	// 重新加载 state 文件构造新 collector，水位线应保留。
@@ -592,5 +616,501 @@ func TestContextCancelledRefreshFails(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
+	}
+}
+
+func summary(n int, result *string, ts int64) *jenkins.BuildSummary {
+	return &jenkins.BuildSummary{Number: n, Result: result, Duration: 1000, Timestamp: ts}
+}
+
+const (
+	testFolder      = "multiarch/src-openeuler/x86-64"
+	folderProject   = "hudson.model.FreeStyleProject"
+	folderClassPath = "com.cloudbees.hudson.plugins.folder.Folder"
+)
+
+func TestFolderAggregation(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{
+			testFolder: {
+				{Name: "a", Class: folderProject, Color: "blue",
+					LastBuild: summary(3, ptr("SUCCESS"), now.Add(-time.Hour).UnixMilli())},
+				{Name: "b", Class: folderProject, Color: "red_anime",
+					LastBuild: summary(9, ptr("FAILURE"), now.Add(-2*time.Hour).UnixMilli())},
+				{Name: "c", Class: folderProject, Color: "notbuilt"},
+				// 子 folder 本身不计入统计。
+				{Name: "sub", Class: folderClassPath},
+			},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+		queue:     []jenkins.QueueItem{{ID: 1}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("folder 聚合应成功")
+	}
+
+	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 3 {
+		t.Errorf("jobs_total = %v, want 3（子 folder 不计入）", v)
+	}
+	for color, want := range map[string]float64{"blue": 1, "red": 1, "notbuilt": 1, "yellow": 0} {
+		if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, color)); v != want {
+			t.Errorf("jobs_by_color{%s} = %v, want %v", color, v, want)
+		}
+	}
+	// 从未构建的 c 计入停滞；a/b 在 24h 内不算。
+	if v := testutil.ToFloat64(m.FolderStaleJobs.Vec().WithLabelValues(testCommunity, testFolder)); v != 1 {
+		t.Errorf("stale_jobs = %v, want 1", v)
+	}
+	// 最近构建是 a 的 1 小时前。
+	age := testutil.ToFloat64(m.FolderLastBuildAge.Vec().WithLabelValues(testCommunity, testFolder))
+	if age < 3500 || age > 3700 {
+		t.Errorf("last_build_age = %v, want ≈3600", age)
+	}
+}
+
+func TestFolderStaleByThreshold(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{
+			testFolder: {
+				// 25 小时前构建，超过 24h 阈值 → 停滞。
+				{Name: "old", Class: folderProject, Color: "blue",
+					LastBuild: summary(1, ptr("SUCCESS"), now.Add(-25*time.Hour).UnixMilli())},
+			},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.FolderStaleJobs.Vec().WithLabelValues(testCommunity, testFolder)); v != 1 {
+		t.Errorf("stale_jobs = %v, want 1", v)
+	}
+}
+
+func TestFolderEmptyAndNoBuildAge(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {}},
+		computers:        []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("空 folder 不应失败")
+	}
+	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 0 {
+		t.Errorf("jobs_total = %v, want 0", v)
+	}
+	// 无任何构建时年龄固定为 0，避免大盘出现无意义的大数。
+	if v := testutil.ToFloat64(m.FolderLastBuildAge.Vec().WithLabelValues(testCommunity, testFolder)); v != 0 {
+		t.Errorf("last_build_age = %v, want 0", v)
+	}
+}
+
+func TestFolderLastSuccessAgeDistinguishesFromLastBuild(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			// 最近一次构建 1 分钟前失败，最近一次成功 3 小时前：
+			// last_build_age 很小（看似健康），last_success_age 很大（真实健康度差）。
+			{Name: "flaky", Class: folderProject, Color: "red",
+				LastBuild:           summary(10, ptr("FAILURE"), now.Add(-time.Minute).UnixMilli()),
+				LastSuccessfulBuild: summary(9, ptr("SUCCESS"), now.Add(-3*time.Hour).UnixMilli())},
+			{Name: "never", Class: folderProject, Color: "notbuilt"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	buildAge := testutil.ToFloat64(m.FolderLastBuildAge.Vec().WithLabelValues(testCommunity, testFolder))
+	if buildAge < 50 || buildAge > 70 {
+		t.Errorf("last_build_age = %v, want ≈60", buildAge)
+	}
+	successAge := testutil.ToFloat64(m.FolderLastSuccessAge.Vec().WithLabelValues(testCommunity, testFolder))
+	if successAge < 3*3600-10 || successAge > 3*3600+10 {
+		t.Errorf("last_success_age = %v, want ≈10800", successAge)
+	}
+}
+
+func TestQueueOldestWaitAndExecutorTotal(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		computers: []jenkins.Computer{
+			{DisplayName: "a0", NumExecutors: 4, BusyExecutors: 3},
+			{DisplayName: "a1", NumExecutors: 2, BusyExecutors: 1},
+		},
+		queue: []jenkins.QueueItem{
+			{ID: 1, InQueueSince: now.Add(-30 * time.Second).UnixMilli()},
+			{ID: 2, InQueueSince: now.Add(-10 * time.Minute).UnixMilli()},
+		},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.ExecutorTotal.Vec().WithLabelValues(testCommunity)); v != 6 {
+		t.Errorf("executor_total = %v, want 6", v)
+	}
+	if v := testutil.ToFloat64(m.ExecutorBusy.Vec().WithLabelValues(testCommunity)); v != 4 {
+		t.Errorf("executor_busy = %v, want 4", v)
+	}
+	// 取最早入队项（10 分钟前），而不是最近入队项。
+	wait := testutil.ToFloat64(m.QueueOldestWait.Vec().WithLabelValues(testCommunity))
+	if wait < 590 || wait > 610 {
+		t.Errorf("queue_oldest_wait = %v, want ≈600", wait)
+	}
+}
+
+func TestQueueOldestWaitEmptyQueue(t *testing.T) {
+	src := &mockSource{computers: []jenkins.Computer{{DisplayName: "a0"}}}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.QueueOldestWait.Vec().WithLabelValues(testCommunity)); v != 0 {
+		t.Errorf("空队列 oldest_wait = %v, want 0", v)
+	}
+}
+
+// newCollectorWithLog 构造可捕获告警日志的 collector（folder 模式）。
+func newCollectorWithLog(t *testing.T, src jenkins.DataSource, folders []string, log *slog.Logger) *Collector {
+	t.Helper()
+	om := newTestMetrics()
+	m := NewMetrics(om)
+	return NewCollector(src, nil, folders, state.New(), t.TempDir()+"/state.json", m,
+		60*time.Second, 24*time.Hour, log)
+}
+
+func warnBuffer() (*slog.Logger, *bytes.Buffer) {
+	buf := &bytes.Buffer{}
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})), buf
+}
+
+func TestRedAlertOnlyAfterTwoConsecutiveRounds(t *testing.T) {
+	log, buf := warnBuffer()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red"},
+			{Name: "ok", Class: folderProject, Color: "blue"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col := newCollectorWithLog(t, src, []string{testFolder}, log)
+
+	// 第 1 轮：首次变红，不告警（可能是正在进行的偶发失败）。
+	col.RefreshOnce(context.Background())
+	if strings.Contains(buf.String(), "连续两轮失败") {
+		t.Fatalf("第 1 轮不应告警，实际输出: %s", buf.String())
+	}
+
+	// 第 2 轮：连续两轮 red，告警且带 job 全路径。
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+	if !strings.Contains(buf.String(), "连续两轮失败") || !strings.Contains(buf.String(), testFolder+"/broken") {
+		t.Fatalf("第 2 轮应告警并带 job 路径，实际输出: %s", buf.String())
+	}
+	// 正常的 blue job 不应出现。
+	if strings.Contains(buf.String(), testFolder+"/ok") {
+		t.Errorf("blue job 不应被告警: %s", buf.String())
+	}
+
+	// 第 3 轮：同一故障不重复告警。
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+	if strings.Contains(buf.String(), "连续两轮失败") {
+		t.Fatalf("同一故障不应重复告警，实际输出: %s", buf.String())
+	}
+}
+
+func TestRedAlertRearmsAfterRecovery(t *testing.T) {
+	log, buf := warnBuffer()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "flaky", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col := newCollectorWithLog(t, src, []string{testFolder}, log)
+
+	col.RefreshOnce(context.Background()) // 第 1 轮 red
+	col.RefreshOnce(context.Background()) // 第 2 轮 red -> 告警
+	buf.Reset()
+
+	// 恢复为绿。
+	src.folderJobsByPath[testFolder][0].Color = "blue"
+	col.RefreshOnce(context.Background())
+	if strings.Contains(buf.String(), "连续两轮失败") {
+		t.Errorf("恢复为绿时不应告警: %s", buf.String())
+	}
+
+	// 再次变红：第 1 轮不告警。
+	src.folderJobsByPath[testFolder][0].Color = "red"
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+	if strings.Contains(buf.String(), "连续两轮失败") {
+		t.Errorf("重新变红的第 1 轮不应告警: %s", buf.String())
+	}
+
+	// 第 2 轮：重新告警。
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+	if !strings.Contains(buf.String(), "连续两轮失败") {
+		t.Errorf("重新变红第 2 轮应再次告警: %s", buf.String())
+	}
+}
+
+func TestRedStatePersistsAcrossRestart(t *testing.T) {
+	log, buf := warnBuffer()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	dir := t.TempDir()
+	statePath := dir + "/state.json"
+	build := func() *Collector {
+		return NewCollector(src, nil, []string{testFolder}, state.New(), statePath,
+			NewMetrics(newTestMetrics()), 60*time.Second, 24*time.Hour, log)
+	}
+	col := build()
+	col.RefreshOnce(context.Background())
+	col.RefreshOnce(context.Background()) // 告警
+	if !strings.Contains(buf.String(), "连续两轮失败") {
+		t.Fatalf("应告警，实际输出: %s", buf.String())
+	}
+
+	// 模拟重启：从同一 state 文件重新加载，red 记录不应丢失，避免重复告警。
+	saved, existed, err := state.Load(statePath)
+	if err != nil || !existed {
+		t.Fatalf("加载 state 失败: err=%v existed=%v", err, existed)
+	}
+	if len(saved.RedSeen) != 1 || len(saved.Alerted) != 1 {
+		t.Fatalf("red 状态未持久化: seen=%v alerted=%v", saved.RedSeen, saved.Alerted)
+	}
+	buf.Reset()
+	restarted := NewCollector(src, nil, []string{testFolder}, saved, statePath,
+		NewMetrics(newTestMetrics()), 60*time.Second, 24*time.Hour, log)
+	restarted.RefreshOnce(context.Background())
+	if strings.Contains(buf.String(), "连续两轮失败") {
+		t.Errorf("重启后不应重复告警: %s", buf.String())
+	}
+}
+
+func TestRedAlertLimitedPerRound(t *testing.T) {
+	log, buf := warnBuffer()
+	jobs := make([]jenkins.Job, 0, maxRedAlertsPerRound+10)
+	for i := 0; i < maxRedAlertsPerRound+10; i++ {
+		jobs = append(jobs, jenkins.Job{Name: fmt.Sprintf("j%03d", i), Class: folderProject, Color: "red"})
+	}
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: jobs},
+		computers:        []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col := newCollectorWithLog(t, src, []string{testFolder}, log)
+	col.RefreshOnce(context.Background())
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+
+	lines := strings.Count(buf.String(), "连续两轮失败")
+	if lines != maxRedAlertsPerRound {
+		t.Errorf("单轮告警条数 = %d, want %d", lines, maxRedAlertsPerRound)
+	}
+	if !strings.Contains(buf.String(), "已省略") {
+		t.Errorf("超出上限应输出省略汇总: %s", buf.String())
+	}
+}
+
+func TestRedStateNotAdvancedWhenFolderFetchFails(t *testing.T) {
+	log, buf := warnBuffer()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col := newCollectorWithLog(t, src, []string{testFolder}, log)
+	col.RefreshOnce(context.Background()) // 第 1 轮：建立 redSeen
+
+	// 第 2 轮拉取失败：不能把 red 当作已恢复而清空。
+	src.folderJobsErr = map[string]error{testFolder: jenkins.ErrUnauthorized}
+	col.RefreshOnce(context.Background())
+	if len(col.State().RedSeen) != 1 {
+		t.Errorf("抓取失败不应清空 red 状态, got %v", col.State().RedSeen)
+	}
+
+	// 第 3 轮恢复：仍为 red，视为连续，应告警。
+	src.folderJobsErr = nil
+	buf.Reset()
+	col.RefreshOnce(context.Background())
+	if !strings.Contains(buf.String(), "连续两轮失败") {
+		t.Errorf("跨失败轮次后仍应告警: %s", buf.String())
+	}
+}
+
+func TestFolderFetchFailureSetsScrapeFail(t *testing.T) {
+	src := &mockSource{
+		folderJobsErr: map[string]error{testFolder: jenkins.ErrUnauthorized},
+		computers:     []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); ok {
+		t.Fatal("folder 拉取失败应整体失败")
+	}
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
+		t.Errorf("scrape_success = %v, want 0", v)
+	}
+}
+
+func TestJobAndFolderWhitelistCoexist(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		topJobs:     []jenkins.Job{{Name: "j", Class: folderProject}},
+		buildsByJob: map[string][]jenkins.Build{"j": baselineBuilds()},
+		folderJobsByPath: map[string][]jenkins.Job{
+			testFolder: {
+				{Name: "a", Class: folderProject, Color: "blue",
+					LastBuild: summary(1, ptr("SUCCESS"), now.Add(-time.Minute).UnixMilli())},
+			},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+		queue:     []jenkins.QueueItem{{ID: 1}},
+	}
+	col, _, m := newCollectorFull(t, src, []string{"j"}, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("两条路径共存应成功")
+	}
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, "j")); v != 0 {
+		t.Errorf("精确 job 指标缺失, consecutive = %v", v)
+	}
+	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 1 {
+		t.Errorf("folder 指标缺失, jobs_total = %v", v)
+	}
+}
+
+func TestFolderMetricsFamiliesExposed(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "a", Class: folderProject, Color: "blue"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, reg, _ := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	body := promText(t, reg)
+	for _, name := range []string{
+		"jenkins_folder_jobs_total",
+		"jenkins_folder_jobs_by_color",
+		"jenkins_folder_last_build_age_seconds",
+		"jenkins_folder_last_success_age_seconds",
+		"jenkins_folder_stale_jobs",
+	} {
+		if !strings.Contains(body, "# HELP "+name) || !strings.Contains(body, "# TYPE "+name) {
+			t.Errorf("缺少指标族 %q 的 HELP/TYPE", name)
+		}
+	}
+}
+
+func TestNormalizeColor(t *testing.T) {
+	cases := map[string]string{
+		"blue":       "blue",
+		"blue_anime": "blue",
+		"red_anime":  "red",
+		"yellow":     "yellow",
+		"aborted":    "aborted",
+		"notbuilt":   "notbuilt",
+		"disabled":   "disabled",
+		"grey":       "unknown",
+		"":           "unknown",
+	}
+	for in, want := range cases {
+		if got := normalizeColor(in); got != want {
+			t.Errorf("normalizeColor(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 精确白名单必须直取：任何一次 Jobs() 调用都意味着又在递归遍历整棵树。
+func TestJobWhitelistFetchesDirectlyWithoutEnumeration(t *testing.T) {
+	const deep = "multiarch/openeuler/x86-64/Gluten"
+	src := &mockSource{
+		topJobs:     []jenkins.Job{{Name: "gate", Class: folderClassPath}},
+		buildsByJob: map[string][]jenkins.Build{deep: baselineBuilds()},
+		computers:   []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollector(t, src, []string{deep}, nil)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("精确白名单直取应成功")
+	}
+	if src.jobsCalls != 0 {
+		t.Errorf("不应调用 Jobs() 枚举, 实际调用 %d 次", src.jobsCalls)
+	}
+	if src.buildsCalls != 1 {
+		t.Errorf("builds 调用 = %d, want 1（每个白名单 job 一次）", src.buildsCalls)
+	}
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, deep)); v != 0 {
+		t.Errorf("consecutive_failures = %v, want 0", v)
+	}
+}
+
+// 失败 job 的身份指标：只有 red 的 job 出序列，blue 的 job 不出。
+func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red_anime"},
+			{Name: "ok", Class: folderProject, Color: "blue"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, reg, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/broken")); v != 1 {
+		t.Errorf("red job 序列 = %v, want 1", v)
+	}
+	body := promText(t, reg)
+	if !strings.Contains(body, `job="`+testFolder+`/broken"`) {
+		t.Errorf("缺少 red job 序列: %s", body)
+	}
+	if strings.Contains(body, `job="`+testFolder+`/ok"`) {
+		t.Errorf("blue job 不应产生 jenkins_job_red 序列: %s", body)
+	}
+}
+
+func TestJobRedSeriesClearsAfterRecovery(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "flaky", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/flaky")); v != 1 {
+		t.Fatalf("red 状态 = %v, want 1", v)
+	}
+
+	src.folderJobsByPath[testFolder][0].Color = "blue"
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/flaky")); v != 0 {
+		t.Errorf("恢复后应置 0, got %v", v)
+	}
+}
+
+func TestJobRedSeriesKeptWhenFolderFetchFails(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	// 拉取失败时不能把指标误判为已恢复。
+	src.folderJobsErr = map[string]error{testFolder: jenkins.ErrUnauthorized}
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/broken")); v != 1 {
+		t.Errorf("抓取失败后应保持 1, got %v", v)
 	}
 }

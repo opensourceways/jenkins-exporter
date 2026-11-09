@@ -151,6 +151,22 @@ func (c *Client) Jobs(ctx context.Context, jobPath string) ([]Job, error) {
 	return resp.Jobs, nil
 }
 
+// folderJobsTree 一次性拉取 folder 直接子 job 的摘要：color 用于状态分布，
+// lastBuild/lastSuccessfulBuild 用于最近构建时间与停滞判定。实测 11600 个 job 约 2.3MB / 0.5s。
+const folderJobsTree = "jobs[name,_class,url,color," +
+	"lastBuild[number,result,duration,timestamp]," +
+	"lastSuccessfulBuild[number,timestamp]]"
+
+// FolderJobs 拉取指定 folder 的直接子 job 摘要（不递归）。用于 folder 级聚合采集。
+func (c *Client) FolderJobs(ctx context.Context, jobPath string) ([]Job, error) {
+	full := c.jobURL(jobPath, folderJobsTree)
+	var resp JobsResponse
+	if _, err := c.getJSON(ctx, full, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Jobs, nil
+}
+
 // Builds 拉取指定 job 全路径最近 100 条构建。
 func (c *Client) Builds(ctx context.Context, jobPath string) ([]Build, error) {
 	full := c.jobURL(jobPath, "builds[number,result,duration,timestamp,builtOn]{0,100}")

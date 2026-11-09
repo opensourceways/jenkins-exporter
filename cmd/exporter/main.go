@@ -50,7 +50,7 @@ func main() {
 		log.Info("在线模式", "jenkins_url", cfg.JenkinsURL, "scrape_interval", cfg.ScrapeInterval.String())
 	}
 
-	col := collector.NewCollector(src, cfg.JobWhitelist, st, cfg.StatePath, metrics, cfg.ScrapeInterval, log)
+	col := collector.NewCollector(src, cfg.JobWhitelist, cfg.FolderWhitelist, st, cfg.StatePath, metrics, cfg.ScrapeInterval, cfg.StaleThreshold, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

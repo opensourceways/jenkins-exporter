@@ -46,6 +46,19 @@ func (s *Source) Jobs(_ context.Context, path string) ([]jenkins.Job, error) {
 	return resp.Jobs, nil
 }
 
+// FolderJobs 返回 jobs.json 中的 job 摘要（fixture 不含 folder，直接返回全部）。
+func (s *Source) FolderJobs(_ context.Context, path string) ([]jenkins.Job, error) {
+	if path != "" {
+		// 离线 fixture 不模拟 folder 下钻，子路径返回空。
+		return nil, nil
+	}
+	var resp jenkins.JobsResponse
+	if err := s.read("jobs.json", &resp); err != nil {
+		return nil, err
+	}
+	return resp.Jobs, nil
+}
+
 // Builds 返回 builds.json（对所有 job 返回同一份样例）。
 func (s *Source) Builds(_ context.Context, _ string) ([]jenkins.Build, error) {
 	var resp jenkins.BuildsResponse

@@ -11,16 +11,18 @@ import (
 
 // Config 是 exporter 运行配置。
 type Config struct {
-	JenkinsURL     string        // JENKINS_URL
-	JenkinsUser    string        // JENKINS_USER
-	TokenFile      string        // JENKINS_TOKEN_FILE
-	ScrapeInterval time.Duration // SCRAPE_INTERVAL
-	JobWhitelist   []string      // JOB_WHITELIST（逗号分隔）
-	StatePath      string        // STATE_PATH
-	ListenAddr     string        // LISTEN_ADDR
-	HTTPTimeout    time.Duration // HTTP_TIMEOUT
-	Offline        bool          // OFFLINE：用 testdata fixture 离线跑
-	FixtureDir     string        // FIXTURE_DIR：离线 fixture 目录
+	JenkinsURL      string        // JENKINS_URL
+	JenkinsUser     string        // JENKINS_USER
+	TokenFile       string        // JENKINS_TOKEN_FILE
+	ScrapeInterval  time.Duration // SCRAPE_INTERVAL
+	JobWhitelist    []string      // JOB_WHITELIST（逗号分隔，精确 job 全路径）
+	FolderWhitelist []string      // FOLDER_WHITELIST（逗号分隔，folder 全路径，按 folder 聚合采集）
+	StaleThreshold  time.Duration // STALE_THRESHOLD：超过该时长未构建视为停滞 job
+	StatePath       string        // STATE_PATH
+	ListenAddr      string        // LISTEN_ADDR
+	HTTPTimeout     time.Duration // HTTP_TIMEOUT
+	Offline         bool          // OFFLINE：用 testdata fixture 离线跑
+	FixtureDir      string        // FIXTURE_DIR：离线 fixture 目录
 }
 
 // Load 从环境变量加载配置并校验。
@@ -30,6 +32,7 @@ func Load() (Config, error) {
 		JenkinsUser:    getenv("JENKINS_USER", ""),
 		TokenFile:      getenv("JENKINS_TOKEN_FILE", "/vault/secrets/jenkins-token"),
 		ScrapeInterval: getDuration("SCRAPE_INTERVAL", 60*time.Second),
+		StaleThreshold: getDuration("STALE_THRESHOLD", 24*time.Hour),
 		StatePath:      getenv("STATE_PATH", "/data/state.json"),
 		ListenAddr:     getenv("LISTEN_ADDR", ":9300"),
 		HTTPTimeout:    getDuration("HTTP_TIMEOUT", 10*time.Second),
@@ -37,6 +40,7 @@ func Load() (Config, error) {
 		FixtureDir:     getenv("FIXTURE_DIR", "testdata"),
 	}
 	cfg.JobWhitelist = parseWhitelist(getenv("JOB_WHITELIST", ""))
+	cfg.FolderWhitelist = parseWhitelist(getenv("FOLDER_WHITELIST", ""))
 
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -62,13 +66,21 @@ func (c Config) validate() error {
 		return fmt.Errorf("HTTP_TIMEOUT 必须为正")
 	}
 	// 白名单为空会导致“启动正常但一个 job 都不采集”，必须显式报错。
-	if len(c.JobWhitelist) == 0 {
-		return fmt.Errorf("JOB_WHITELIST 必填（逗号分隔的 job 全路径）")
+	if len(c.JobWhitelist) == 0 && len(c.FolderWhitelist) == 0 {
+		return fmt.Errorf("JOB_WHITELIST 与 FOLDER_WHITELIST 至少配置一个")
 	}
 	for _, job := range c.JobWhitelist {
 		if strings.ContainsAny(job, " \t\r\n") {
 			return fmt.Errorf("JOB_WHITELIST 条目 %q 含空白字符，job 全路径不应包含空格", job)
 		}
+	}
+	for _, f := range c.FolderWhitelist {
+		if strings.ContainsAny(f, " \t\r\n") {
+			return fmt.Errorf("FOLDER_WHITELIST 条目 %q 含空白字符，folder 全路径不应包含空格", f)
+		}
+	}
+	if c.StaleThreshold <= 0 {
+		return fmt.Errorf("STALE_THRESHOLD 必须为正")
 	}
 	return nil
 }
