@@ -19,7 +19,6 @@ const maxBackoff = 5 * time.Minute
 // Collector 负责刷新循环：拉取 → 解析 → delta 计算 → 更新指标 → 持久化 state。
 type Collector struct {
 	src             jenkins.DataSource
-	whitelist       map[string]bool
 	whitelistOrder  []string
 	folderWhitelist []string
 	staleThreshold  time.Duration
@@ -33,6 +32,9 @@ type Collector struct {
 	// 两者配合实现「连续两轮 red 才告警，同一故障只告警一次」。
 	redSeen map[string]bool
 	alerted map[string]bool
+	// redJobs 记录「曾经变红过」的 job，用于在恢复时把 jenkins_job_red 置 0。
+	// 只增不删：保留 0 值序列便于回看，数量以历史失败过的 job 为上限。
+	redJobs map[string]bool
 }
 
 // maxRedAlertsPerRound 限制单轮输出的失败 job 告警条数，避免大规模故障时刷爆日志。
@@ -41,16 +43,11 @@ const maxRedAlertsPerRound = 50
 // NewCollector 构造 Collector。state 由外部加载（可为基线空 State）。
 // whitelist 为精确 job 全路径；folderWhitelist 为按 folder 聚合采集的 folder 全路径。
 func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, st *state.State, statePath string, m *Metrics, scrapeInterval, staleThreshold time.Duration, log *slog.Logger) *Collector {
-	wl := make(map[string]bool, len(whitelist))
-	for _, j := range whitelist {
-		wl[j] = true
-	}
 	m.InitJobSeries(whitelist)
 	m.InitFolderSeries(folderWhitelist)
 	redSeen, alerted := st.RedMaps()
 	return &Collector{
 		src:             src,
-		whitelist:       wl,
 		whitelistOrder:  whitelist,
 		folderWhitelist: folderWhitelist,
 		staleThreshold:  staleThreshold,
@@ -61,6 +58,7 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 		log:             log,
 		redSeen:         redSeen,
 		alerted:         alerted,
+		redJobs:         make(map[string]bool),
 	}
 }
 
@@ -115,18 +113,15 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 		return false
 	}
 
-	// 精确 job 路径：仅当配置了 JOB_WHITELIST 时才做全量递归枚举，避免无谓开销。
-	jobsOK := true
+	// 精确 job 路径：直接按配置的全路径拉取构建。
+	// 不再从根递归枚举整棵 job 树 —— cn4 光 multiarch/src-openeuler 就有 4.6 万 job，
+	// 为了几个重点 job 去遍历全树是分钟级、数 MB 的开销。
+	// 配置了但 Jenkins 不存在的路径会在 Builds 处失败并 warn，不影响其它 job。
 	var targets []string
 	jobBuilds := make(map[string][]jenkins.Build)
 	jobOK := 0
-	if len(c.whitelist) > 0 {
-		leaves, err := jenkins.EnumerateLeafJobs(ctx, c.src, "")
-		jobsOK = err == nil
-		if err != nil {
-			c.log.Warn("拉取 job 列表失败", "err", err.Error())
-		}
-		targets = c.filterWhitelist(leaves)
+	if len(c.whitelistOrder) > 0 {
+		targets = c.whitelistOrder
 		jobBuilds = make(map[string][]jenkins.Build, len(targets))
 		for _, job := range targets {
 			builds, berr := c.src.Builds(ctx, job)
@@ -145,6 +140,10 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	if foldersOK && len(c.folderWhitelist) > 0 {
 		c.processRedTransitions(currentRed)
 	}
+	// 失败 job 的身份指标与状态机同源，同样只在拉取成功时更新，避免整批置 0。
+	if foldersOK && len(c.folderWhitelist) > 0 {
+		c.syncRedJobSeries(currentRed)
+	}
 
 	computers, cerr := c.src.Computers(ctx)
 	computersOK := cerr == nil
@@ -158,7 +157,7 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 		c.log.Warn("拉取 queue 失败", "err", qerr.Error())
 	}
 
-	success := jobsOK && foldersOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
+	success := foldersOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
 
 	c.processAndPersist(jobBuilds, computers, computersOK, items, queueOK)
 	c.finalize(success)
@@ -315,25 +314,19 @@ func (c *Collector) finalize(success bool) {
 	c.metrics.ExporterLastRefreshTime.Set(float64(time.Now().Unix()))
 }
 
-func (c *Collector) filterWhitelist(leaves []string) []string {
-	if len(c.whitelist) == 0 {
-		return nil
+// syncRedJobSeries 把当前 red 的 job 身份写入指标：red=1，已恢复=0。
+// 只有曾经变红的 job 才会产生序列，因此 series 数上限是「历史失败过的 job 数」，
+// 与 folder 聚合一次拿到的数据同源，不额外请求 Jenkins。
+func (c *Collector) syncRedJobSeries(current map[string]bool) {
+	for job := range current {
+		c.metrics.JobRed.Set(1, job)
+		c.redJobs[job] = true
 	}
-	out := make([]string, 0, len(c.whitelistOrder))
-	seen := map[string]bool{}
-	for _, l := range leaves {
-		if c.whitelist[l] && !seen[l] {
-			seen[l] = true
-			out = append(out, l)
+	for job := range c.redJobs {
+		if !current[job] {
+			c.metrics.JobRed.Set(0, job)
 		}
 	}
-	// 白名单中存在但 Jenkins 不存在的 job：保留以维持指标序列并 warn 一次。
-	for _, w := range c.whitelistOrder {
-		if !seen[w] {
-			c.log.Warn("白名单 job 在 Jenkins 不存在", "job", w)
-		}
-	}
-	return out
 }
 
 // processJob 处理单个 job 的构建：基线或增量。

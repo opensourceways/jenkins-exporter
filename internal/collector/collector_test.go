@@ -46,12 +46,14 @@ type mockSource struct {
 	computersErr  error
 	queueErr      error
 	buildsCalls   int
+	jobsCalls     int
 
 	folderJobsByPath map[string][]jenkins.Job
 	folderJobsErr    map[string]error
 }
 
 func (m *mockSource) Jobs(_ context.Context, path string) ([]jenkins.Job, error) {
+	m.jobsCalls++
 	if m.jobsErr != nil {
 		return nil, m.jobsErr
 	}
@@ -351,16 +353,18 @@ func TestEmptyBuildHistoryBaseline(t *testing.T) {
 	}
 }
 
-func TestJobsFetchFailureSetsScrapeFail(t *testing.T) {
+func TestJobBuildsFetchFailureSetsScrapeFail(t *testing.T) {
+	// 精确白名单走直取，不再拉 job 列表；单个 job 的 builds 拉取失败即为整体失败。
 	src := &mockSource{
-		jobsErr:   jenkins.ErrUnauthorized,
+		topJobs:   []jenkins.Job{{Name: "j", Class: "hudson.model.FreeStyleProject"}},
+		buildsErr: map[string]error{"j": jenkins.ErrUnauthorized},
 		computers: []jenkins.Computer{{DisplayName: "a0"}},
 		queue:     []jenkins.QueueItem{{ID: 1}},
 	}
 	col, _, m := newCollector(t, src, []string{"j"}, nil)
 	ok := col.RefreshOnce(context.Background())
 	if ok {
-		t.Fatal("job 列表失败应整体失败")
+		t.Fatal("job 构建拉取失败应整体失败")
 	}
 	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
 		t.Errorf("scrape_success = %v, want 0", v)
@@ -1023,5 +1027,90 @@ func TestNormalizeColor(t *testing.T) {
 		if got := normalizeColor(in); got != want {
 			t.Errorf("normalizeColor(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// 精确白名单必须直取：任何一次 Jobs() 调用都意味着又在递归遍历整棵树。
+func TestJobWhitelistFetchesDirectlyWithoutEnumeration(t *testing.T) {
+	const deep = "multiarch/openeuler/x86-64/Gluten"
+	src := &mockSource{
+		topJobs:     []jenkins.Job{{Name: "gate", Class: folderClassPath}},
+		buildsByJob: map[string][]jenkins.Build{deep: baselineBuilds()},
+		computers:   []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollector(t, src, []string{deep}, nil)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("精确白名单直取应成功")
+	}
+	if src.jobsCalls != 0 {
+		t.Errorf("不应调用 Jobs() 枚举, 实际调用 %d 次", src.jobsCalls)
+	}
+	if src.buildsCalls != 1 {
+		t.Errorf("builds 调用 = %d, want 1（每个白名单 job 一次）", src.buildsCalls)
+	}
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, deep)); v != 0 {
+		t.Errorf("consecutive_failures = %v, want 0", v)
+	}
+}
+
+// 失败 job 的身份指标：只有 red 的 job 出序列，blue 的 job 不出。
+func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red_anime"},
+			{Name: "ok", Class: folderProject, Color: "blue"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, reg, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/broken")); v != 1 {
+		t.Errorf("red job 序列 = %v, want 1", v)
+	}
+	body := promText(t, reg)
+	if !strings.Contains(body, `job="`+testFolder+`/broken"`) {
+		t.Errorf("缺少 red job 序列: %s", body)
+	}
+	if strings.Contains(body, `job="`+testFolder+`/ok"`) {
+		t.Errorf("blue job 不应产生 jenkins_job_red 序列: %s", body)
+	}
+}
+
+func TestJobRedSeriesClearsAfterRecovery(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "flaky", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/flaky")); v != 1 {
+		t.Fatalf("red 状态 = %v, want 1", v)
+	}
+
+	src.folderJobsByPath[testFolder][0].Color = "blue"
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/flaky")); v != 0 {
+		t.Errorf("恢复后应置 0, got %v", v)
+	}
+}
+
+func TestJobRedSeriesKeptWhenFolderFetchFails(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	// 拉取失败时不能把指标误判为已恢复。
+	src.folderJobsErr = map[string]error{testFolder: jenkins.ErrUnauthorized}
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/broken")); v != 1 {
+		t.Errorf("抓取失败后应保持 1, got %v", v)
 	}
 }

@@ -30,6 +30,11 @@ type Metrics struct {
 	FolderLastSuccessAge *obsmetrics.GaugeVec
 	FolderStaleJobs      *obsmetrics.GaugeVec
 
+	// JobRed 给出失败 job 的具体身份：仅对「曾经变红」的 job 出序列，恢复后置 0。
+	// 全量 job 都走 folder 聚合，若逐个出序列会产生上千条无用 series；
+	// 而失败 job 通常只有几十个，按需出序列既能让告警带上 job 名，又不增加任何 Jenkins 请求。
+	JobRed *obsmetrics.GaugeVec
+
 	knownResults     []string
 	defaultCommunity string
 }
@@ -74,6 +79,8 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 			"folder 内最近一次成功构建距今秒数；0 表示该 folder 从未成功过。", "folder"),
 		FolderStaleJobs: om.NewGaugeVec("jenkins_folder_stale_jobs",
 			"超过 STALE_THRESHOLD 未构建（或从未构建）的 job 数。", "folder"),
+		JobRed: om.NewGaugeVec("jenkins_job_red",
+			"job 当前是否失败（Jenkins color=red）：1 失败，0 已恢复。仅对曾经失败的 job 出序列。", "job"),
 	}
 }
 
