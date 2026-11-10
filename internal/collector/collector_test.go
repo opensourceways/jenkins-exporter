@@ -1114,3 +1114,53 @@ func TestJobRedSeriesKeptWhenFolderFetchFails(t *testing.T) {
 		t.Errorf("抓取失败后应保持 1, got %v", v)
 	}
 }
+
+// 失败 job 的构建号：值取 lastBuild.number，job_url 为恒定的 job 页面地址，
+// 大盘用 job_url + 值拼出构建日志页。
+func TestJobLastFailedBuildAndURL(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red_anime", LastBuild: &jenkins.BuildSummary{Number: 1221}},
+			{Name: "ok", Class: folderProject, Color: "blue"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	log, _ := warnBuffer()
+	om := newTestMetrics()
+	m := NewMetrics(om)
+	col := NewCollector(src, nil, []string{testFolder}, state.New(), t.TempDir()+"/state.json", m,
+		60*time.Second, 24*time.Hour, log, WithWebURL("https://ci.example.com/"))
+	col.RefreshOnce(context.Background())
+
+	job := testFolder + "/broken"
+	wantURL := "https://ci.example.com/job/" + strings.ReplaceAll(job, "/", "/job/")
+	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, job, wantURL)); v != 1221 {
+		t.Errorf("失败构建号 = %v, want 1221", v)
+	}
+
+	// 恢复正常后构建号应清零，避免大盘继续展示已修复的历史失败。
+	src.folderJobsByPath[testFolder][0].Color = "blue"
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, job, wantURL)); v != 0 {
+		t.Errorf("恢复后构建号应置 0, got %v", v)
+	}
+}
+
+// 未配置 webURL 时链接标签为空，但不能影响指标数值。
+func TestJobLastFailedBuildWithoutWebURL(t *testing.T) {
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: &jenkins.BuildSummary{Number: 7}},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	log, _ := warnBuffer()
+	m := NewMetrics(newTestMetrics())
+	col := NewCollector(src, nil, []string{testFolder}, state.New(), t.TempDir()+"/state.json", m,
+		60*time.Second, 24*time.Hour, log)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, testFolder+"/broken", "")); v != 7 {
+		t.Errorf("失败构建号 = %v, want 7", v)
+	}
+}
