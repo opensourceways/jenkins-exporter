@@ -35,6 +35,11 @@ type Metrics struct {
 	// 而失败 job 通常只有几十个，按需出序列既能让告警带上 job 名，又不增加任何 Jenkins 请求。
 	JobRed *obsmetrics.GaugeVec
 
+	// JobLastFailedBuild 给出失败 job 最近一次失败的构建号，值即构建编号（0 表示已恢复）。
+	// job_url 是 job 页面地址（不含构建号，恒定值，不会随构建号变化产生新 series），
+	// 大盘用 job_url + 值拼出构建页链接，点进去即可看失败日志。
+	JobLastFailedBuild *obsmetrics.GaugeVec
+
 	knownResults     []string
 	defaultCommunity string
 }
@@ -81,6 +86,9 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 			"超过 STALE_THRESHOLD 未构建（或从未构建）的 job 数。", "folder"),
 		JobRed: om.NewGaugeVec("jenkins_job_red",
 			"job 当前是否失败（Jenkins color=red）：1 失败，0 已恢复。仅对曾经失败的 job 出序列。", "job"),
+		JobLastFailedBuild: om.NewGaugeVec("jenkins_job_last_failed_build",
+			"当前失败 job 最近一次失败的构建编号；0 表示已恢复。job_url 为 job 页面地址，可与编号拼出构建页链接。",
+			"job", "job_url"),
 	}
 }
 

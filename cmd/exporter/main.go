@@ -50,7 +50,12 @@ func main() {
 		log.Info("在线模式", "jenkins_url", cfg.JenkinsURL, "scrape_interval", cfg.ScrapeInterval.String())
 	}
 
-	col := collector.NewCollector(src, cfg.JobWhitelist, cfg.FolderWhitelist, st, cfg.StatePath, metrics, cfg.ScrapeInterval, cfg.StaleThreshold, log)
+	// JENKINS_WEB_URL 未配置时沿用 JENKINS_URL，保证实时值与链接地址同源。
+	webURL := cfg.JenkinsWebURL
+	if webURL == "" {
+		webURL = cfg.JenkinsURL
+	}
+	col := collector.NewCollector(src, cfg.JobWhitelist, cfg.FolderWhitelist, st, cfg.StatePath, metrics, cfg.ScrapeInterval, cfg.StaleThreshold, log, collector.WithWebURL(webURL))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

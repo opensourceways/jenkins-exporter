@@ -12,6 +12,7 @@ import (
 // Config 是 exporter 运行配置。
 type Config struct {
 	JenkinsURL      string        // JENKINS_URL
+	JenkinsWebURL   string        // JENKINS_WEB_URL：Jenkins 网页根地址，用于拼构建页链接；为空则沿用 JENKINS_URL
 	JenkinsUser     string        // JENKINS_USER
 	TokenFile       string        // JENKINS_TOKEN_FILE
 	ScrapeInterval  time.Duration // SCRAPE_INTERVAL
@@ -29,6 +30,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		JenkinsURL:     getenv("JENKINS_URL", ""),
+		JenkinsWebURL:  getenv("JENKINS_WEB_URL", ""),
 		JenkinsUser:    getenv("JENKINS_USER", ""),
 		TokenFile:      getenv("JENKINS_TOKEN_FILE", "/vault/secrets/jenkins-token"),
 		ScrapeInterval: getDuration("SCRAPE_INTERVAL", 60*time.Second),

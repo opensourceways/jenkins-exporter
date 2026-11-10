@@ -35,6 +35,20 @@ type Collector struct {
 	// redJobs 记录「曾经变红过」的 job，用于在恢复时把 jenkins_job_red 置 0。
 	// 只增不删：保留 0 值序列便于回看，数量以历史失败过的 job 为上限。
 	redJobs map[string]bool
+
+	// webURL 是 Jenkins 的网页根地址，用于拼 job 页面链接（生产是公网域名，
+	// 与采集用的集群内 Service 地址不同）。为空时降级为不带链接。
+	webURL string
+}
+
+// Option 用于给 Collector 注入可选依赖，保持既有调用签名不变。
+type Option func(*Collector)
+
+// WithWebURL 设置 Jenkins 网页根地址（如 https://ci.openeuler.openatom.cn）。
+func WithWebURL(u string) Option {
+	return func(c *Collector) {
+		c.webURL = strings.TrimSuffix(u, "/")
+	}
 }
 
 // maxRedAlertsPerRound 限制单轮输出的失败 job 告警条数，避免大规模故障时刷爆日志。
@@ -42,11 +56,11 @@ const maxRedAlertsPerRound = 50
 
 // NewCollector 构造 Collector。state 由外部加载（可为基线空 State）。
 // whitelist 为精确 job 全路径；folderWhitelist 为按 folder 聚合采集的 folder 全路径。
-func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, st *state.State, statePath string, m *Metrics, scrapeInterval, staleThreshold time.Duration, log *slog.Logger) *Collector {
+func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, st *state.State, statePath string, m *Metrics, scrapeInterval, staleThreshold time.Duration, log *slog.Logger, opts ...Option) *Collector {
 	m.InitJobSeries(whitelist)
 	m.InitFolderSeries(folderWhitelist)
 	redSeen, alerted := st.RedMaps()
-	return &Collector{
+	c := &Collector{
 		src:             src,
 		whitelistOrder:  whitelist,
 		folderWhitelist: folderWhitelist,
@@ -60,6 +74,10 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 		alerted:         alerted,
 		redJobs:         make(map[string]bool),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Run 启动后台刷新循环（失败指数退避，成功按 scrapeInterval）。阻塞直到 ctx 取消。
@@ -135,14 +153,14 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	}
 
 	// folder 聚合路径：每个配置的 folder 一次请求，内存聚合，不产生 per-job series。
-	foldersOK, currentRed := c.refreshFolders(ctx)
+	foldersOK, currentRed, redBuilds := c.refreshFolders(ctx)
 	// 只有全部 folder 都拉取成功时才推进 red 状态机，否则会把抓取失败的 folder 误判为「已恢复」。
 	if foldersOK && len(c.folderWhitelist) > 0 {
 		c.processRedTransitions(currentRed)
 	}
 	// 失败 job 的身份指标与状态机同源，同样只在拉取成功时更新，避免整批置 0。
 	if foldersOK && len(c.folderWhitelist) > 0 {
-		c.syncRedJobSeries(currentRed)
+		c.syncRedJobSeries(currentRed, redBuilds)
 	}
 
 	computers, cerr := c.src.Computers(ctx)
@@ -165,11 +183,13 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 }
 
 // refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。
-// 返回是否全部 folder 成功，以及本轮所有 red job 的全路径集合（供失败告警使用）。
-func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool) {
+// 返回是否全部 folder 成功、本轮所有 red job 的全路径集合（供失败告警使用），
+// 以及这些 red job 最近一次失败构建的编号（供大盘直达构建页，取不到时为 0）。
+func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, map[string]int) {
 	red := make(map[string]bool)
+	redBuilds := make(map[string]int)
 	if len(c.folderWhitelist) == 0 {
-		return true, red
+		return true, red, redBuilds
 	}
 	ok := true
 	now := time.Now()
@@ -186,11 +206,15 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool) 
 				continue
 			}
 			if normalizeColor(j.Color) == "red" {
-				red[folder+"/"+j.Name] = true
+				full := folder + "/" + j.Name
+				red[full] = true
+				if j.LastBuild != nil {
+					redBuilds[full] = j.LastBuild.Number
+				}
 			}
 		}
 	}
-	return ok, red
+	return ok, red, redBuilds
 }
 
 // processRedTransitions 推进失败 job 状态机并输出告警日志。
@@ -317,16 +341,32 @@ func (c *Collector) finalize(success bool) {
 // syncRedJobSeries 把当前 red 的 job 身份写入指标：red=1，已恢复=0。
 // 只有曾经变红的 job 才会产生序列，因此 series 数上限是「历史失败过的 job 数」，
 // 与 folder 聚合一次拿到的数据同源，不额外请求 Jenkins。
-func (c *Collector) syncRedJobSeries(current map[string]bool) {
+// 同时写入最近一次失败的构建号，供大盘直接跳到该构建的日志页。
+func (c *Collector) syncRedJobSeries(current map[string]bool, builds map[string]int) {
 	for job := range current {
 		c.metrics.JobRed.Set(1, job)
+		if n := builds[job]; n > 0 {
+			c.metrics.JobLastFailedBuild.Set(float64(n), job, c.jobURL(job))
+		}
 		c.redJobs[job] = true
 	}
 	for job := range c.redJobs {
 		if !current[job] {
 			c.metrics.JobRed.Set(0, job)
+			c.metrics.JobLastFailedBuild.Set(0, job, c.jobURL(job))
 		}
 	}
+}
+
+// jobURL 把 job 全路径转成 Jenkins 网页地址（不含构建号）。
+// Jenkins 的 URL 规则是每一级目录都加 /job/ 前缀，例如
+// multiarch/openeuler/x86-64/golang → {web}/job/multiarch/job/openeuler/job/x86-64/job/golang。
+// webURL 未配置时返回空串，指标里保留空标签，大盘上的链接会失效但不影响数值。
+func (c *Collector) jobURL(job string) string {
+	if c.webURL == "" || job == "" {
+		return ""
+	}
+	return c.webURL + "/job/" + strings.ReplaceAll(job, "/", "/job/")
 }
 
 // processJob 处理单个 job 的构建：基线或增量。

@@ -34,6 +34,7 @@ curl -s localhost:9300/healthz   # ok
 | 配置项 | 环境变量 | 默认值 | 必填 | 说明 |
 | --- | --- | --- | --- | --- |
 | Jenkins 地址 | `JENKINS_URL` | — | 在线必填 | 如 `http://jenkins.jenkins.svc.cluster.local:8080` |
+| Jenkins 网页地址 | `JENKINS_WEB_URL` | 同 `JENKINS_URL` | 否 | 指标里拼 job/构建页链接用；集群内 Service 地址不能对外访问时应配公网域名 |
 | Jenkins 用户 | `JENKINS_USER` | — | 在线必填 | Basic 认证用户名 |
 | token 文件 | `JENKINS_TOKEN_FILE` | `/vault/secrets/jenkins-token` | 在线必填 | 文件卷挂载；进程读文件，不打日志 |
 | 刷新间隔 | `SCRAPE_INTERVAL` | `60s` | 否 | 后台刷新周期 |
@@ -50,7 +51,7 @@ curl -s localhost:9300/healthz   # ok
 >
 > \* `JOB_WHITELIST` 与 `FOLDER_WHITELIST` 至少配置一个；两者都配置时两套指标同时输出。
 
-## 指标（9 + 5 + 2）
+## 指标（9 + 5 + 2 + 2）
 
 | 指标 | 类型 | 标签 | 说明 |
 | --- | --- | --- | --- |
@@ -68,6 +69,8 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_folder_last_build_age_seconds` | gauge | `folder` | folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建 |
 | `jenkins_folder_last_success_age_seconds` | gauge | `folder` | folder 内最近一次成功构建距今秒数；0 表示从未成功过。用于识别「一直在跑但一直失败」的 job |
 | `jenkins_folder_stale_jobs` | gauge | `folder` | 超过 `STALE_THRESHOLD` 未构建（或从未构建）的 job 数 |
+| `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 当前红色、0 已恢复（恢复后保留 0 值序列） |
+| `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
 | `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：最近一次刷新是否成功 |
 | `jenkins_exporter_last_refresh_timestamp_seconds` | gauge | 无 | 自监控：最近一次刷新完成时间（秒） |
 
@@ -81,6 +84,8 @@ folder 聚合指标只保留汇总，不暴露 job 身份。为了能定位到�
 - **同一故障只告警一次**：job 恢复为绿之前不重复输出，恢复后再次变红会重新走「两轮」判定。
 - **每轮最多 50 条**：超出部分汇总为一条「本轮另有 job 连续失败，已省略」，避免大规模故障刷爆日志。
 - **抓取失败不推进状态**：某轮 folder 拉取失败时跳过状态机，避免把「没采到」误判成「已恢复」。
+
+同一状态机还顺带产出 `jenkins_job_red` 与 `jenkins_job_last_failed_build`：前者是失败 job 身份，后者给出最近一次失败的构建编号（配合 `job_url` 拼出构建日志页），大盘表格据此可一键跳转失败现场。
 
 日志示例：
 
