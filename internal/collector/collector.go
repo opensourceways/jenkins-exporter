@@ -16,6 +16,18 @@ import (
 // maxBackoff 是失败退避上限（5 分钟）。
 const maxBackoff = 5 * time.Minute
 
+// deadJobThreshold 定义「废弃 job」：最后一次构建距今超过一年。
+// 由于构建时间必然不早于成功时间，超过一年的 job 在过去一年里既没有成功也没有构建，
+// 按成功处理，避免长期占用红色/停滞统计并让大盘出现以年为单位的陈旧数据。
+const deadJobThreshold = 365 * 24 * time.Hour
+
+// isDeadJob 判断 job 是否已废弃。从未构建（没有 lastBuild 或时间戳为 0）的 job
+// 缺少时间基准，无法判断存在时长，仍按 notbuilt 口径统计。
+func isDeadJob(j *jenkins.Job, now time.Time) bool {
+	return j.LastBuild != nil && j.LastBuild.Timestamp > 0 &&
+		now.Sub(time.UnixMilli(j.LastBuild.Timestamp)) > deadJobThreshold
+}
+
 // Collector 负责刷新循环：拉取 → 解析 → delta 计算 → 更新指标 → 持久化 state。
 type Collector struct {
 	src             jenkins.DataSource
@@ -225,6 +237,10 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 			if jenkins.IsFolderClass(j.Class) {
 				continue
 			}
+			// 废弃 job 已按成功处理，不再进入红色集合，避免大盘出现以年为单位的失败时长。
+			if isDeadJob(&j, now) {
+				continue
+			}
 			if normalizeColor(j.Color) == "red" {
 				full := folder + "/" + j.Name
 				red[full] = true
@@ -293,20 +309,22 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 		total++
 		full := folder + "/" + j.Name
 		currentJobs[full] = true
+		// 废弃 job（一年内既无成功也无构建）视为成功：计入 blue，不计停滞，
+		// 也不参与最近成功/构建时间的计算，避免 folder 级指标被陈年数据拖老。
+		if isDeadJob(&j, now) {
+			counts["blue"]++
+			// 时间戳仍按真实值输出，供需要审计的查询使用。
+			c.setJobTimestamps(&j, full)
+			continue
+		}
 		counts[normalizeColor(j.Color)]++
 		if j.LastSuccessfulBuild != nil && j.LastSuccessfulBuild.Timestamp > newestSuccess {
 			newestSuccess = j.LastSuccessfulBuild.Timestamp
 		}
 		// 与白名单 job 共用同一指标：folder 内叶子 job 也输出最近成功时间，
 		// 供「连续失败超过 N 天」判断（当前 red + 距最近一次成功超过阈值）。
-		if j.LastSuccessfulBuild != nil {
-			c.metrics.JobLastSuccessTimestamp.Set(float64(j.LastSuccessfulBuild.Timestamp/1000), full)
-		} else {
-			c.metrics.JobLastSuccessTimestamp.Set(0, full)
-		}
+		c.setJobTimestamps(&j, full)
 		if j.LastBuild != nil {
-			// 指标单位是秒，Jenkins 返回毫秒；0 表示从未构建。
-			c.metrics.JobLastBuildTimestamp.Set(float64(j.LastBuild.Timestamp/1000), full)
 			if j.LastBuild.Timestamp > newest {
 				newest = j.LastBuild.Timestamp
 			}
@@ -316,8 +334,6 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 			// 只有「曾经构建过、但最近一次构建早于停滞阈值」才算停滞；
 			// 从未构建的 job 属于 notbuilt 状态，由颜色维度单独体现，避免淹没真正的停摆 job。
 			stale++
-		} else {
-			c.metrics.JobLastBuildTimestamp.Set(0, full)
 		}
 	}
 
@@ -336,6 +352,20 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 		c.metrics.FolderLastSuccessAge.Set(0, folder)
 	}
 	c.metrics.FolderStaleJobs.Set(float64(stale), folder)
+}
+
+// setJobTimestamps 输出叶子 job 的最近成功/最近构建时间戳（秒），从未发生时为 0。
+func (c *Collector) setJobTimestamps(j *jenkins.Job, full string) {
+	if j.LastSuccessfulBuild != nil {
+		c.metrics.JobLastSuccessTimestamp.Set(float64(j.LastSuccessfulBuild.Timestamp/1000), full)
+	} else {
+		c.metrics.JobLastSuccessTimestamp.Set(0, full)
+	}
+	if j.LastBuild != nil {
+		c.metrics.JobLastBuildTimestamp.Set(float64(j.LastBuild.Timestamp/1000), full)
+	} else {
+		c.metrics.JobLastBuildTimestamp.Set(0, full)
+	}
 }
 
 // normalizeColor 归一化 Jenkins color：去掉 _anime（构建中）后缀，未知值归为 unknown。
