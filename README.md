@@ -51,7 +51,7 @@ curl -s localhost:9300/healthz   # ok
 >
 > \* `JOB_WHITELIST` 与 `FOLDER_WHITELIST` 至少配置一个；两者都配置时两套指标同时输出。
 
-## 指标（9 + 5 + 2 + 2）
+## 指标
 
 | 指标 | 类型 | 标签 | 说明 |
 | --- | --- | --- | --- |
@@ -71,6 +71,7 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_folder_stale_jobs` | gauge | `folder` | 超过 `STALE_THRESHOLD` 未构建（或从未构建）的 job 数 |
 | `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 当前红色、0 已恢复（恢复后保留 0 值序列） |
 | `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
+| `jenkins_job_last_build_timestamp_seconds` | gauge | `job` | folder 内叶子 job 最近一次构建的时间戳（秒）；0 表示从未构建。用于「超过一天没有执行」告警；job 被移除后置 0 |
 | `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：最近一次刷新是否成功 |
 | `jenkins_exporter_last_refresh_timestamp_seconds` | gauge | 无 | 自监控：最近一次刷新完成时间（秒） |
 

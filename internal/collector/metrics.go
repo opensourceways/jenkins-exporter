@@ -40,6 +40,11 @@ type Metrics struct {
 	// 大盘用 job_url + 值拼出构建页链接，点进去即可看失败日志。
 	JobLastFailedBuild *obsmetrics.GaugeVec
 
+	// JobLastBuildTimestamp 给出 folder 内每个叶子 job 最近一次构建的时间戳（秒），
+	// 用于「超过一天没有执行」类告警；0 表示从未构建或该 job 已从 folder 移除。
+	// 序列数量与 FOLDER_WHITELIST 下叶子 job 数同级，不随 Jenkins 全站 job 数膨胀。
+	JobLastBuildTimestamp *obsmetrics.GaugeVec
+
 	knownResults     []string
 	defaultCommunity string
 }
@@ -89,6 +94,8 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 		JobLastFailedBuild: om.NewGaugeVec("jenkins_job_last_failed_build",
 			"当前失败 job 最近一次失败的构建编号；0 表示已恢复。job_url 为 job 页面地址，可与编号拼出构建页链接。",
 			"job", "job_url"),
+		JobLastBuildTimestamp: om.NewGaugeVec("jenkins_job_last_build_timestamp_seconds",
+			"folder 内叶子 job 最近一次构建的时间戳（秒）；0 表示从未构建。仅覆盖 FOLDER_WHITELIST。", "job"),
 	}
 }
 
