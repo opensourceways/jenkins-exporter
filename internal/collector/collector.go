@@ -284,6 +284,13 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 		if j.LastSuccessfulBuild != nil && j.LastSuccessfulBuild.Timestamp > newestSuccess {
 			newestSuccess = j.LastSuccessfulBuild.Timestamp
 		}
+		// 与白名单 job 共用同一指标：folder 内叶子 job 也输出最近成功时间，
+		// 供「连续失败超过 N 天」判断（当前 red + 距最近一次成功超过阈值）。
+		if j.LastSuccessfulBuild != nil {
+			c.metrics.JobLastSuccessTimestamp.Set(float64(j.LastSuccessfulBuild.Timestamp/1000), full)
+		} else {
+			c.metrics.JobLastSuccessTimestamp.Set(0, full)
+		}
 		if j.LastBuild != nil {
 			// 指标单位是秒，Jenkins 返回毫秒；0 表示从未构建。
 			c.metrics.JobLastBuildTimestamp.Set(float64(j.LastBuild.Timestamp/1000), full)
@@ -293,11 +300,12 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 			if now.Sub(time.UnixMilli(j.LastBuild.Timestamp)) <= c.staleThreshold {
 				continue
 			}
+			// 只有「曾经构建过、但最近一次构建早于停滞阈值」才算停滞；
+			// 从未构建的 job 属于 notbuilt 状态，由颜色维度单独体现，避免淹没真正的停摆 job。
+			stale++
 		} else {
 			c.metrics.JobLastBuildTimestamp.Set(0, full)
 		}
-		// 从未构建，或最近一次构建早于停滞阈值。
-		stale++
 	}
 
 	c.metrics.FolderJobsTotal.Set(float64(total), folder)

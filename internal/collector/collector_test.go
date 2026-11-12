@@ -635,10 +635,15 @@ func TestFolderAggregation(t *testing.T) {
 		folderJobsByPath: map[string][]jenkins.Job{
 			testFolder: {
 				{Name: "a", Class: folderProject, Color: "blue",
-					LastBuild: summary(3, ptr("SUCCESS"), now.Add(-time.Hour).UnixMilli())},
+					LastBuild:           summary(3, ptr("SUCCESS"), now.Add(-time.Hour).UnixMilli()),
+					LastSuccessfulBuild: summary(3, ptr("SUCCESS"), now.Add(-time.Hour).UnixMilli())},
 				{Name: "b", Class: folderProject, Color: "red_anime",
 					LastBuild: summary(9, ptr("FAILURE"), now.Add(-2*time.Hour).UnixMilli())},
 				{Name: "c", Class: folderProject, Color: "notbuilt"},
+				// 曾经成功过、但已超过停滞阈值：计入 stale。
+				{Name: "d", Class: folderProject, Color: "blue",
+					LastBuild:           summary(2, ptr("SUCCESS"), now.Add(-48*time.Hour).UnixMilli()),
+					LastSuccessfulBuild: summary(2, ptr("SUCCESS"), now.Add(-48*time.Hour).UnixMilli())},
 				// 子 folder 本身不计入统计。
 				{Name: "sub", Class: folderClassPath},
 			},
@@ -651,17 +656,24 @@ func TestFolderAggregation(t *testing.T) {
 		t.Fatal("folder 聚合应成功")
 	}
 
-	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 3 {
-		t.Errorf("jobs_total = %v, want 3（子 folder 不计入）", v)
+	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 4 {
+		t.Errorf("jobs_total = %v, want 4（子 folder 不计入）", v)
 	}
-	for color, want := range map[string]float64{"blue": 1, "red": 1, "notbuilt": 1, "yellow": 0} {
+	for color, want := range map[string]float64{"blue": 2, "red": 1, "notbuilt": 1, "yellow": 0} {
 		if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, color)); v != want {
 			t.Errorf("jobs_by_color{%s} = %v, want %v", color, v, want)
 		}
 	}
-	// 从未构建的 c 计入停滞；a/b 在 24h 内不算。
+	// 只有 d（曾经构建、但超过 24h）计入停滞；从未构建的 c 不计入。
 	if v := testutil.ToFloat64(m.FolderStaleJobs.Vec().WithLabelValues(testCommunity, testFolder)); v != 1 {
 		t.Errorf("stale_jobs = %v, want 1", v)
+	}
+	// folder 内叶子 job 的最近成功时间：有记录取秒值，从未成功为 0。
+	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/a")); v != float64(now.Add(-time.Hour).UnixMilli()/1000) {
+		t.Errorf("a last_success = %v, want ≈now-1h", v)
+	}
+	if v := testutil.ToFloat64(m.JobLastSuccessTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/c")); v != 0 {
+		t.Errorf("c 从未成功应为 0, got %v", v)
 	}
 	// 最近构建是 a 的 1 小时前。
 	age := testutil.ToFloat64(m.FolderLastBuildAge.Vec().WithLabelValues(testCommunity, testFolder))
