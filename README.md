@@ -40,7 +40,7 @@ curl -s localhost:9300/healthz   # ok
 | 刷新间隔 | `SCRAPE_INTERVAL` | `60s` | 否 | 后台刷新周期 |
 | job 白名单 | `JOB_WHITELIST` | — | 否* | 逗号分隔的 job 全路径，如 `folder/sub/job1,job2`；逐 job 采集构建历史 |
 | folder 白名单 | `FOLDER_WHITELIST` | — | 否* | 逗号分隔的 folder 全路径，如 `multiarch/src-openeuler/x86-64`；按 folder 聚合采集，不展开 per-job series |
-| 停滞阈值 | `STALE_THRESHOLD` | `24h` | 否 | 超过该时长未构建的 job 计入 `jenkins_folder_stale_jobs` |
+| 停滞阈值 | `STALE_THRESHOLD` | `24h` | 否 | 曾经构建过、但超过该时长未再构建的 job 计入 `jenkins_folder_stale_jobs`（从未构建的 job 不计入） |
 | 状态文件 | `STATE_PATH` | `/data/state.json` | 否 | PVC 上水位线文件 |
 | 监听地址 | `LISTEN_ADDR` | `:9300` | 否 | /metrics 监听 |
 | 单请求超时 | `HTTP_TIMEOUT` | `10s` | 否 | 单个 Jenkins 请求超时 |
@@ -58,7 +58,7 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_build_result_total` | counter | `job`, `result` | result ∈ {SUCCESS,FAILURE,ABORTED,UNSTABLE}；每个新 finished 构建按 result 累加 1 |
 | `jenkins_build_duration_seconds` | histogram | `job` | 桶 60/300/600/1800/3600/7200/14400；观察 duration/1000 秒 |
 | `jenkins_job_consecutive_failures` | gauge | `job` | 连续 FAILURE 次数；SUCCESS 清零，UNSTABLE/ABORTED 中性不变 |
-| `jenkins_job_last_success_timestamp_seconds` | gauge | `job` | 最近 SUCCESS 构建时间（秒） |
+| `jenkins_job_last_success_timestamp_seconds` | gauge | `job` | 最近 SUCCESS 构建时间（秒）；0 表示从未成功。folder 内叶子 job 也会输出，与 `jenkins_job_red` 联用可算「连续失败超过 N 天」 |
 | `jenkins_agent_online` | gauge | `agent` | 1 在线，0 离线（temporarilyOffline 不影响 online 判定） |
 | `jenkins_executor_busy` | gauge | 无 | 全局忙碌 executor 数 |
 | `jenkins_executor_total` | gauge | 无 | 全局 executor 总数；与 busy 相除即饱和度 |
@@ -68,7 +68,7 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_folder_jobs_by_color` | gauge | `folder`, `color` | 按 Jenkins color 分类的 job 数；`_anime` 后缀已归一化，未知值归 `unknown` |
 | `jenkins_folder_last_build_age_seconds` | gauge | `folder` | folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建 |
 | `jenkins_folder_last_success_age_seconds` | gauge | `folder` | folder 内最近一次成功构建距今秒数；0 表示从未成功过。用于识别「一直在跑但一直失败」的 job |
-| `jenkins_folder_stale_jobs` | gauge | `folder` | 超过 `STALE_THRESHOLD` 未构建（或从未构建）的 job 数 |
+| `jenkins_folder_stale_jobs` | gauge | `folder` | 曾经构建过、但超过 `STALE_THRESHOLD` 未再构建的 job 数；从未构建的 job（notbuilt）不计入 |
 | `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 当前红色、0 已恢复（恢复后保留 0 值序列） |
 | `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
 | `jenkins_job_last_build_timestamp_seconds` | gauge | `job` | folder 内叶子 job 最近一次构建的时间戳（秒）；0 表示从未构建。用于「超过一天没有执行」告警；job 被移除后置 0 |
