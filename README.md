@@ -57,7 +57,7 @@ curl -s localhost:9300/healthz   # ok
 | --- | --- | --- | --- |
 | `jenkins_build_result_total` | counter | `job`, `result` | result ∈ {SUCCESS,FAILURE,ABORTED,UNSTABLE}；每个新 finished 构建按 result 累加 1 |
 | `jenkins_build_duration_seconds` | histogram | `job` | 桶 60/300/600/1800/3600/7200/14400；观察 duration/1000 秒 |
-| `jenkins_job_consecutive_failures` | gauge | `job` | 连续 FAILURE 次数；SUCCESS 清零，UNSTABLE/ABORTED 中性不变 |
+| `jenkins_job_consecutive_failures` | gauge | `job` | 连续 FAILURE 次数；SUCCESS 清零，UNSTABLE/ABORTED 中性不变。白名单 job 由增量状态机产出；folder 内当前红色 job 由构建历史回算（仅在最近构建号变化时回源，稳态零额外请求），用于区分「连续重试仍失败」与「失败一次就没人重试」 |
 | `jenkins_job_last_success_timestamp_seconds` | gauge | `job` | 最近 SUCCESS 构建时间（秒）；0 表示从未成功。folder 内叶子 job 也会输出，与 `jenkins_job_red` 联用可算「连续失败超过 N 天」 |
 | `jenkins_agent_online` | gauge | `agent` | 1 在线，0 离线（temporarilyOffline 不影响 online 判定） |
 | `jenkins_executor_busy` | gauge | 无 | 全局忙碌 executor 数 |

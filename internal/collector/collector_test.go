@@ -1236,3 +1236,88 @@ func TestJobLastBuildTimestampKeptWhenFolderFetchFails(t *testing.T) {
 		t.Errorf("抓取失败后时间戳应保持不变, got %v", v)
 	}
 }
+
+// 红色 folder job 的连续失败次数：从最新构建往回数，SUCCESS 终止。
+func TestRedJobConsecutiveFailures(t *testing.T) {
+	job := testFolder + "/broken"
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(5, ptr("FAILURE"), 1698000050000)},
+		}},
+		buildsByJob: map[string][]jenkins.Build{job: {
+			{Number: 2, Result: ptr("SUCCESS")},
+			{Number: 3, Result: ptr("FAILURE")},
+			{Number: 4, Result: ptr("FAILURE")},
+			{Number: 5, Result: ptr("FAILURE")},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, job)); v != 3 {
+		t.Errorf("连续失败次数 = %v, want 3", v)
+	}
+}
+
+// UNSTABLE/ABORTED 视为中性：不累加也不终止连续失败计数。
+func TestRedJobConsecutiveFailuresNeutralResults(t *testing.T) {
+	job := testFolder + "/flaky"
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "flaky", Class: folderProject, Color: "red", LastBuild: summary(4, ptr("FAILURE"), 1698000040000)},
+		}},
+		buildsByJob: map[string][]jenkins.Build{job: {
+			{Number: 1, Result: ptr("SUCCESS")},
+			{Number: 2, Result: ptr("FAILURE")},
+			{Number: 3, Result: ptr("ABORTED")},
+			{Number: 4, Result: ptr("FAILURE")},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, job)); v != 2 {
+		t.Errorf("连续失败次数 = %v, want 2（ABORTED 中性跳过）", v)
+	}
+}
+
+// 最近构建号没变时复用缓存，不重复回源拉构建历史。
+func TestRedJobStreakCachedByLastBuildNumber(t *testing.T) {
+	job := testFolder + "/broken"
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(2, ptr("FAILURE"), 1698000020000)},
+		}},
+		buildsByJob: map[string][]jenkins.Build{job: {
+			{Number: 1, Result: ptr("SUCCESS")},
+			{Number: 2, Result: ptr("FAILURE")},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+	if src.buildsCalls != 1 {
+		t.Fatalf("首轮应回源 1 次, got %d", src.buildsCalls)
+	}
+
+	col.RefreshOnce(context.Background())
+	if src.buildsCalls != 1 {
+		t.Errorf("构建号未变不应重复回源, got %d", src.buildsCalls)
+	}
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, job)); v != 1 {
+		t.Errorf("缓存值应继续输出 = 1, got %v", v)
+	}
+
+	// 新构建出现：重新回源并更新。
+	src.folderJobsByPath[testFolder][0].LastBuild = summary(3, ptr("FAILURE"), 1698000030000)
+	src.buildsByJob[job] = append(src.buildsByJob[job], jenkins.Build{Number: 3, Result: ptr("FAILURE")})
+	col.RefreshOnce(context.Background())
+	if src.buildsCalls != 2 {
+		t.Errorf("新构建应触发回源, got %d", src.buildsCalls)
+	}
+	if v := testutil.ToFloat64(m.JobConsecutiveFailures.Vec().WithLabelValues(testCommunity, job)); v != 2 {
+		t.Errorf("连续失败次数 = %v, want 2", v)
+	}
+}
