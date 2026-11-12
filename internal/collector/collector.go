@@ -38,6 +38,10 @@ type Collector struct {
 	// lastBuildJobs 是上一轮输出过 last_build 时间戳的 job，用于把已从 folder 移除的 job 置 0，
 	// 避免陈旧时间戳随时间推移误触发「超过一天没有执行」告警。
 	lastBuildJobs map[string]bool
+	// redStreaks 缓存红色 job 的连续失败次数，键为 job 全路径。
+	// folder 摘要每轮都会带上 lastBuild 编号，只有编号变化才回源拉一次构建历史，
+	// 稳态下不产生额外 Jenkins 请求。
+	redStreaks map[string]redStreak
 
 	// webURL 是 Jenkins 的网页根地址，用于拼 job 页面链接（生产是公网域名，
 	// 与采集用的集群内 Service 地址不同）。为空时降级为不带链接。
@@ -56,6 +60,17 @@ func WithWebURL(u string) Option {
 
 // maxRedAlertsPerRound 限制单轮输出的失败 job 告警条数，避免大规模故障时刷爆日志。
 const maxRedAlertsPerRound = 50
+
+// maxStreakFetchPerRound 限制单轮回源拉取构建历史的 red job 数，
+// 避免大面积失败时对 Jenkins 造成成百上千次额外请求。
+const maxStreakFetchPerRound = 200
+
+// redStreak 是单个失败 job 的连续失败次数缓存。
+// lastBuildNumber 与 folder 摘要同源，用于判断是否需要回源重算。
+type redStreak struct {
+	lastBuildNumber int
+	failures        int
+}
 
 // NewCollector 构造 Collector。state 由外部加载（可为基线空 State）。
 // whitelist 为精确 job 全路径；folderWhitelist 为按 folder 聚合采集的 folder 全路径。
@@ -77,6 +92,7 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 		alerted:         alerted,
 		redJobs:         make(map[string]bool),
 		lastBuildJobs:   make(map[string]bool),
+		redStreaks:      make(map[string]redStreak),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -157,14 +173,13 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	}
 
 	// folder 聚合路径：每个配置的 folder 一次请求，内存聚合，不产生 per-job series。
-	foldersOK, currentRed, redBuilds := c.refreshFolders(ctx)
+	foldersOK, currentRed, redLastBuild := c.refreshFolders(ctx)
 	// 只有全部 folder 都拉取成功时才推进 red 状态机，否则会把抓取失败的 folder 误判为「已恢复」。
 	if foldersOK && len(c.folderWhitelist) > 0 {
 		c.processRedTransitions(currentRed)
-	}
-	// 失败 job 的身份指标与状态机同源，同样只在拉取成功时更新，避免整批置 0。
-	if foldersOK && len(c.folderWhitelist) > 0 {
-		c.syncRedJobSeries(currentRed, redBuilds)
+		// 失败 job 的身份指标与状态机同源，同样只在拉取成功时更新，避免整批置 0。
+		c.syncRedJobSeries(currentRed, redLastBuild)
+		c.syncRedJobStreaks(ctx, currentRed, redLastBuild)
 	}
 
 	computers, cerr := c.src.Computers(ctx)
@@ -188,12 +203,12 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 
 // refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。
 // 返回是否全部 folder 成功、本轮所有 red job 的全路径集合（供失败告警使用），
-// 以及这些 red job 最近一次失败构建的编号（供大盘直达构建页，取不到时为 0）。
-func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, map[string]int) {
+// 以及这些 red job 的最近构建摘要（供大盘直达构建页与连续失败次数计算，取不到时为 nil）。
+func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, map[string]*jenkins.BuildSummary) {
 	red := make(map[string]bool)
-	redBuilds := make(map[string]int)
+	redLastBuild := make(map[string]*jenkins.BuildSummary)
 	if len(c.folderWhitelist) == 0 {
-		return true, red, redBuilds
+		return true, red, redLastBuild
 	}
 	ok := true
 	now := time.Now()
@@ -213,9 +228,7 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 			if normalizeColor(j.Color) == "red" {
 				full := folder + "/" + j.Name
 				red[full] = true
-				if j.LastBuild != nil {
-					redBuilds[full] = j.LastBuild.Number
-				}
+				redLastBuild[full] = j.LastBuild
 			}
 		}
 	}
@@ -228,7 +241,7 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 		}
 		c.lastBuildJobs = currentJobs
 	}
-	return ok, red, redBuilds
+	return ok, red, redLastBuild
 }
 
 // processRedTransitions 推进失败 job 状态机并输出告警日志。
@@ -370,11 +383,11 @@ func (c *Collector) finalize(success bool) {
 // 只有曾经变红的 job 才会产生序列，因此 series 数上限是「历史失败过的 job 数」，
 // 与 folder 聚合一次拿到的数据同源，不额外请求 Jenkins。
 // 同时写入最近一次失败的构建号，供大盘直接跳到该构建的日志页。
-func (c *Collector) syncRedJobSeries(current map[string]bool, builds map[string]int) {
+func (c *Collector) syncRedJobSeries(current map[string]bool, lastBuild map[string]*jenkins.BuildSummary) {
 	for job := range current {
 		c.metrics.JobRed.Set(1, job)
-		if n := builds[job]; n > 0 {
-			c.metrics.JobLastFailedBuild.Set(float64(n), job, c.jobURL(job))
+		if lb := lastBuild[job]; lb != nil && lb.Number > 0 {
+			c.metrics.JobLastFailedBuild.Set(float64(lb.Number), job, c.jobURL(job))
 		}
 		c.redJobs[job] = true
 	}
@@ -384,6 +397,63 @@ func (c *Collector) syncRedJobSeries(current map[string]bool, builds map[string]
 			c.metrics.JobLastFailedBuild.Set(0, job, c.jobURL(job))
 		}
 	}
+}
+
+// syncRedJobStreaks 为当前 red 的 folder job 计算连续 FAILURE 次数，写入
+// jenkins_job_consecutive_failures（与白名单 job 复用同一指标）。
+// 判据与增量状态机一致：FAILURE 累加，SUCCESS 终止，UNSTABLE/ABORTED 中性跳过。
+// folder 摘要每轮都带 lastBuild 编号，只有编号变化才回源拉构建历史，
+// 因此稳态下（没有任何新构建）不产生额外请求。
+func (c *Collector) syncRedJobStreaks(ctx context.Context, current map[string]bool, lastBuild map[string]*jenkins.BuildSummary) {
+	fetched := 0
+	skipped := 0
+	for job := range current {
+		lb := lastBuild[job]
+		if lb == nil || lb.Number <= 0 {
+			continue
+		}
+		if s, ok := c.redStreaks[job]; ok && s.lastBuildNumber == lb.Number {
+			c.metrics.JobConsecutiveFailures.Set(float64(s.failures), job)
+			continue
+		}
+		if fetched >= maxStreakFetchPerRound {
+			skipped++
+			continue
+		}
+		fetched++
+		builds, err := c.src.Builds(ctx, job)
+		if err != nil {
+			c.log.Warn("拉取失败 job 构建历史失败，跳过连续失败次数", "job", job, "err", err.Error())
+			continue
+		}
+		failures := countFailureStreak(builds)
+		c.redStreaks[job] = redStreak{lastBuildNumber: lb.Number, failures: failures}
+		c.metrics.JobConsecutiveFailures.Set(float64(failures), job)
+	}
+	if skipped > 0 {
+		c.log.Warn("本轮失败 job 过多，部分 job 未计算连续失败次数", "skipped", skipped)
+	}
+}
+
+// countFailureStreak 从最新构建往回数连续 FAILURE 次数。
+// 未完成构建（result 为 nil）跳过，SUCCESS 终止，UNSTABLE/ABORTED 视为中性继续往前。
+func countFailureStreak(builds []jenkins.Build) int {
+	sorted := make([]jenkins.Build, len(builds))
+	copy(sorted, builds)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Number > sorted[j].Number })
+	n := 0
+	for _, b := range sorted {
+		if b.Result == nil {
+			continue
+		}
+		switch *b.Result {
+		case jenkins.ResultFailure:
+			n++
+		case jenkins.ResultSuccess:
+			return n
+		}
+	}
+	return n
 }
 
 // jobURL 把 job 全路径转成 Jenkins 网页地址（不含构建号）。
