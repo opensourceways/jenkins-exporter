@@ -35,6 +35,9 @@ type Collector struct {
 	// redJobs 记录「曾经变红过」的 job，用于在恢复时把 jenkins_job_red 置 0。
 	// 只增不删：保留 0 值序列便于回看，数量以历史失败过的 job 为上限。
 	redJobs map[string]bool
+	// lastBuildJobs 是上一轮输出过 last_build 时间戳的 job，用于把已从 folder 移除的 job 置 0，
+	// 避免陈旧时间戳随时间推移误触发「超过一天没有执行」告警。
+	lastBuildJobs map[string]bool
 
 	// webURL 是 Jenkins 的网页根地址，用于拼 job 页面链接（生产是公网域名，
 	// 与采集用的集群内 Service 地址不同）。为空时降级为不带链接。
@@ -73,6 +76,7 @@ func NewCollector(src jenkins.DataSource, whitelist, folderWhitelist []string, s
 		redSeen:         redSeen,
 		alerted:         alerted,
 		redJobs:         make(map[string]bool),
+		lastBuildJobs:   make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -193,6 +197,7 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 	}
 	ok := true
 	now := time.Now()
+	currentJobs := make(map[string]bool)
 	for _, folder := range c.folderWhitelist {
 		jobs, err := c.src.FolderJobs(ctx, folder)
 		if err != nil {
@@ -200,7 +205,7 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 			ok = false
 			continue
 		}
-		c.aggregateFolder(folder, jobs, now)
+		c.aggregateFolder(folder, jobs, now, currentJobs)
 		for _, j := range jobs {
 			if jenkins.IsFolderClass(j.Class) {
 				continue
@@ -213,6 +218,15 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 				}
 			}
 		}
+	}
+	// 全部 folder 拉取成功才清理已消失的 job：部分失败时无法区分「job 被删」与「这轮没拉到」。
+	if ok {
+		for job := range c.lastBuildJobs {
+			if !currentJobs[job] {
+				c.metrics.JobLastBuildTimestamp.Set(0, job)
+			}
+		}
+		c.lastBuildJobs = currentJobs
 	}
 	return ok, red, redBuilds
 }
@@ -255,7 +269,7 @@ func (c *Collector) processRedTransitions(current map[string]bool) {
 
 // aggregateFolder 把 folder 直接子 job 的状态聚合为 folder 级指标。
 // 只统计叶子 job；子 folder 本身不计数（需覆盖时显式列入 FOLDER_WHITELIST）。
-func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.Time) {
+func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.Time, currentJobs map[string]bool) {
 	counts := make(map[string]int, len(JenkinsColorValues))
 	total, stale := 0, 0
 	var newest, newestSuccess int64
@@ -264,17 +278,23 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 			continue
 		}
 		total++
+		full := folder + "/" + j.Name
+		currentJobs[full] = true
 		counts[normalizeColor(j.Color)]++
 		if j.LastSuccessfulBuild != nil && j.LastSuccessfulBuild.Timestamp > newestSuccess {
 			newestSuccess = j.LastSuccessfulBuild.Timestamp
 		}
 		if j.LastBuild != nil {
+			// 指标单位是秒，Jenkins 返回毫秒；0 表示从未构建。
+			c.metrics.JobLastBuildTimestamp.Set(float64(j.LastBuild.Timestamp/1000), full)
 			if j.LastBuild.Timestamp > newest {
 				newest = j.LastBuild.Timestamp
 			}
 			if now.Sub(time.UnixMilli(j.LastBuild.Timestamp)) <= c.staleThreshold {
 				continue
 			}
+		} else {
+			c.metrics.JobLastBuildTimestamp.Set(0, full)
 		}
 		// 从未构建，或最近一次构建早于停滞阈值。
 		stale++

@@ -1069,10 +1069,22 @@ func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
 		t.Errorf("red job 序列 = %v, want 1", v)
 	}
 	body := promText(t, reg)
-	if !strings.Contains(body, `job="`+testFolder+`/broken"`) {
+	var redBroken, redOK bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "jenkins_job_red{") {
+			continue
+		}
+		if strings.Contains(line, `job="`+testFolder+`/broken"`) {
+			redBroken = true
+		}
+		if strings.Contains(line, `job="`+testFolder+`/ok"`) {
+			redOK = true
+		}
+	}
+	if !redBroken {
 		t.Errorf("缺少 red job 序列: %s", body)
 	}
-	if strings.Contains(body, `job="`+testFolder+`/ok"`) {
+	if redOK {
 		t.Errorf("blue job 不应产生 jenkins_job_red 序列: %s", body)
 	}
 }
@@ -1162,5 +1174,53 @@ func TestJobLastFailedBuildWithoutWebURL(t *testing.T) {
 
 	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, testFolder+"/broken", "")); v != 7 {
 		t.Errorf("失败构建号 = %v, want 7", v)
+	}
+}
+
+// 每个叶子 job 的最近构建时间：Jenkins 毫秒转秒，从未构建为 0；
+// job 从 folder 移除后同样置 0，避免陈旧时间戳长期触发「超过一天没有执行」。
+func TestJobLastBuildTimestamp(t *testing.T) {
+	ts := time.Now().Add(-30 * time.Hour).UnixMilli()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "old", Class: folderProject, Color: "blue", LastBuild: summary(5, ptr("SUCCESS"), ts)},
+			{Name: "never", Class: folderProject, Color: "notbuilt"},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	if v := testutil.ToFloat64(m.JobLastBuildTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/old")); v != float64(ts/1000) {
+		t.Errorf("last_build = %v, want %v（秒）", v, float64(ts/1000))
+	}
+	if v := testutil.ToFloat64(m.JobLastBuildTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/never")); v != 0 {
+		t.Errorf("从未构建应为 0, got %v", v)
+	}
+
+	// 移除 job 后下一轮应置 0。
+	src.folderJobsByPath[testFolder] = src.folderJobsByPath[testFolder][1:]
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobLastBuildTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/old")); v != 0 {
+		t.Errorf("job 移除后应置 0, got %v", v)
+	}
+}
+
+// folder 拉取失败时保留上一轮时间戳，不能误判为「从未构建」。
+func TestJobLastBuildTimestampKeptWhenFolderFetchFails(t *testing.T) {
+	ts := time.Now().Add(-time.Hour).UnixMilli()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
+			{Name: "a", Class: folderProject, Color: "blue", LastBuild: summary(1, ptr("SUCCESS"), ts)},
+		}},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	src.folderJobsErr = map[string]error{testFolder: jenkins.ErrUnauthorized}
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobLastBuildTimestamp.Vec().WithLabelValues(testCommunity, testFolder+"/a")); v != float64(ts/1000) {
+		t.Errorf("抓取失败后时间戳应保持不变, got %v", v)
 	}
 }
