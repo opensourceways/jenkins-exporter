@@ -702,6 +702,52 @@ func TestFolderStaleByThreshold(t *testing.T) {
 	}
 }
 
+func TestFolderDeadJobsTreatedAsSuccess(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{
+			testFolder: {
+				// 两年前失败后再没构建：既无成功也无构建，视为成功。
+				{Name: "abandoned", Class: folderProject, Color: "red",
+					LastBuild: summary(7, ptr("FAILURE"), now.Add(-730*24*time.Hour).UnixMilli())},
+				// 一年零一天前成功过：同样视为成功。
+				{Name: "dormant", Class: folderProject, Color: "blue",
+					LastBuild:           summary(3, ptr("SUCCESS"), now.Add(-366*24*time.Hour).UnixMilli()),
+					LastSuccessfulBuild: summary(3, ptr("SUCCESS"), now.Add(-366*24*time.Hour).UnixMilli())},
+				// 近期失败：正常计入红色。
+				{Name: "active", Class: folderProject, Color: "red",
+					LastBuild: summary(9, ptr("FAILURE"), now.Add(-time.Hour).UnixMilli())},
+			},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("folder 聚合应成功")
+	}
+
+	if v := testutil.ToFloat64(m.FolderJobsTotal.Vec().WithLabelValues(testCommunity, testFolder)); v != 3 {
+		t.Errorf("jobs_total = %v, want 3（废弃 job 仍计入总数）", v)
+	}
+	if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, "red")); v != 1 {
+		t.Errorf("red = %v, want 1（超过一年的红色 job 不计入）", v)
+	}
+	if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, "blue")); v != 2 {
+		t.Errorf("blue = %v, want 2（废弃 job 按成功计数）", v)
+	}
+	if v := testutil.ToFloat64(m.FolderStaleJobs.Vec().WithLabelValues(testCommunity, testFolder)); v != 0 {
+		t.Errorf("stale_jobs = %v, want 0（废弃 job 不计停滞）", v)
+	}
+	// 陈年数据不参与 folder 最近构建时间：只剩 active 的 1 小时前。
+	age := testutil.ToFloat64(m.FolderLastBuildAge.Vec().WithLabelValues(testCommunity, testFolder))
+	if age < 3500 || age > 3700 {
+		t.Errorf("last_build_age = %v, want ≈3600（忽略废弃 job）", age)
+	}
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/abandoned")); v != 0 {
+		t.Errorf("abandoned 不应进入红色集合, got %v", v)
+	}
+}
+
 func TestFolderEmptyAndNoBuildAge(t *testing.T) {
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {}},
@@ -1242,7 +1288,7 @@ func TestRedJobConsecutiveFailures(t *testing.T) {
 	job := testFolder + "/broken"
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
-			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(5, ptr("FAILURE"), 1698000050000)},
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(5, ptr("FAILURE"), time.Now().Add(-time.Hour).UnixMilli())},
 		}},
 		buildsByJob: map[string][]jenkins.Build{job: {
 			{Number: 2, Result: ptr("SUCCESS")},
@@ -1265,7 +1311,7 @@ func TestRedJobConsecutiveFailuresNeutralResults(t *testing.T) {
 	job := testFolder + "/flaky"
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
-			{Name: "flaky", Class: folderProject, Color: "red", LastBuild: summary(4, ptr("FAILURE"), 1698000040000)},
+			{Name: "flaky", Class: folderProject, Color: "red", LastBuild: summary(4, ptr("FAILURE"), time.Now().Add(-time.Hour).UnixMilli())},
 		}},
 		buildsByJob: map[string][]jenkins.Build{job: {
 			{Number: 1, Result: ptr("SUCCESS")},
@@ -1288,7 +1334,7 @@ func TestRedJobStreakCachedByLastBuildNumber(t *testing.T) {
 	job := testFolder + "/broken"
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
-			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(2, ptr("FAILURE"), 1698000020000)},
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: summary(2, ptr("FAILURE"), time.Now().Add(-2*time.Hour).UnixMilli())},
 		}},
 		buildsByJob: map[string][]jenkins.Build{job: {
 			{Number: 1, Result: ptr("SUCCESS")},
@@ -1311,7 +1357,7 @@ func TestRedJobStreakCachedByLastBuildNumber(t *testing.T) {
 	}
 
 	// 新构建出现：重新回源并更新。
-	src.folderJobsByPath[testFolder][0].LastBuild = summary(3, ptr("FAILURE"), 1698000030000)
+	src.folderJobsByPath[testFolder][0].LastBuild = summary(3, ptr("FAILURE"), time.Now().Add(-time.Hour).UnixMilli())
 	src.buildsByJob[job] = append(src.buildsByJob[job], jenkins.Build{Number: 3, Result: ptr("FAILURE")})
 	col.RefreshOnce(context.Background())
 	if src.buildsCalls != 2 {
