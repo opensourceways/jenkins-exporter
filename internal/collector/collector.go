@@ -16,10 +16,11 @@ import (
 // maxBackoff 是失败退避上限（5 分钟）。
 const maxBackoff = 5 * time.Minute
 
-// deadJobThreshold 定义「废弃 job」：最后一次构建距今超过一年。
-// 由于构建时间必然不早于成功时间，超过一年的 job 在过去一年里既没有成功也没有构建，
-// 按成功处理，避免长期占用红色/停滞统计并让大盘出现以年为单位的陈旧数据。
-const deadJobThreshold = 365 * 24 * time.Hour
+// deadJobThreshold 定义「废弃 job」：最后一次构建距今超过一周。
+// 由于构建时间必然不早于成功时间，超过一周的 job 在这一周里既没有成功也没有构建，
+// 按成功处理，避免长期占用红色/停滞统计并让失败告警长期挂在一年前的旧构建上。
+// 只要 job 重新跑一次（不论成败），lastBuild 时间戳被刷新，即恢复为活跃 job。
+const deadJobThreshold = 7 * 24 * time.Hour
 
 // isDeadJob 判断 job 是否已废弃。从未构建（没有 lastBuild 或时间戳为 0）的 job
 // 缺少时间基准，无法判断存在时长，仍按 notbuilt 口径统计。
@@ -259,7 +260,7 @@ func (c *Collector) refreshFolders(ctx context.Context) folderSnapshot {
 			if jenkins.IsFolderClass(j.Class) {
 				continue
 			}
-			// 废弃 job 已按成功处理，不再进入红色集合，避免大盘出现以年为单位的失败时长。
+			// 废弃 job 已按成功处理，不再进入红色集合，避免红了一周都没人处理的 job 一直告警。
 			if isDeadJob(&j, now) {
 				continue
 			}
@@ -379,7 +380,7 @@ func (c *Collector) aggregateFolder(folder string, jobs []jenkins.Job, now time.
 		total++
 		full := folder + "/" + j.Name
 		currentJobs[full] = true
-		// 废弃 job（一年内既无成功也无构建）视为成功：计入 blue，不计停滞，
+		// 废弃 job（一周内既无成功也无构建）视为成功：计入 blue，不计停滞，
 		// 也不参与最近成功/构建时间的计算，避免 folder 级指标被陈年数据拖老。
 		if isDeadJob(&j, now) {
 			counts["blue"]++

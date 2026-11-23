@@ -710,10 +710,10 @@ func TestFolderDeadJobsTreatedAsSuccess(t *testing.T) {
 				// 两年前失败后再没构建：既无成功也无构建，视为成功。
 				{Name: "abandoned", Class: folderProject, Color: "red",
 					LastBuild: summary(7, ptr("FAILURE"), now.Add(-730*24*time.Hour).UnixMilli())},
-				// 一年零一天前成功过：同样视为成功。
+				// 一周多以前成功过：同样视为成功。
 				{Name: "dormant", Class: folderProject, Color: "blue",
-					LastBuild:           summary(3, ptr("SUCCESS"), now.Add(-366*24*time.Hour).UnixMilli()),
-					LastSuccessfulBuild: summary(3, ptr("SUCCESS"), now.Add(-366*24*time.Hour).UnixMilli())},
+					LastBuild:           summary(3, ptr("SUCCESS"), now.Add(-8*24*time.Hour).UnixMilli()),
+					LastSuccessfulBuild: summary(3, ptr("SUCCESS"), now.Add(-8*24*time.Hour).UnixMilli())},
 				// 近期失败：正常计入红色。
 				{Name: "active", Class: folderProject, Color: "red",
 					LastBuild: summary(9, ptr("FAILURE"), now.Add(-time.Hour).UnixMilli())},
@@ -730,7 +730,7 @@ func TestFolderDeadJobsTreatedAsSuccess(t *testing.T) {
 		t.Errorf("jobs_total = %v, want 3（废弃 job 仍计入总数）", v)
 	}
 	if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, "red")); v != 1 {
-		t.Errorf("red = %v, want 1（超过一年的红色 job 不计入）", v)
+		t.Errorf("red = %v, want 1（超过一周的红色 job 不计入）", v)
 	}
 	if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, "blue")); v != 2 {
 		t.Errorf("blue = %v, want 2（废弃 job 按成功计数）", v)
@@ -745,6 +745,37 @@ func TestFolderDeadJobsTreatedAsSuccess(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/abandoned")); v != 0 {
 		t.Errorf("abandoned 不应进入红色集合, got %v", v)
+	}
+}
+
+func TestDeadJobOneWeekBoundary(t *testing.T) {
+	now := time.Now()
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{
+			testFolder: {
+				// 6 天前失败：仍在一周内，算活跃，计入红色并产生告警系列。
+				{Name: "sixdays", Class: folderProject, Color: "red",
+					LastBuild: summary(11, ptr("FAILURE"), now.Add(-6*24*time.Hour).UnixMilli())},
+				// 8 天前失败：超过一周，按废弃 job 处理，不再告警。
+				{Name: "eightdays", Class: folderProject, Color: "red",
+					LastBuild: summary(12, ptr("FAILURE"), now.Add(-8*24*time.Hour).UnixMilli())},
+			},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{testFolder}, nil, 24*time.Hour)
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Fatal("folder 聚合应成功")
+	}
+
+	if v := testutil.ToFloat64(m.FolderJobsByColor.Vec().WithLabelValues(testCommunity, testFolder, "red")); v != 1 {
+		t.Errorf("red = %v, want 1（只有一周内的失败计入红色）", v)
+	}
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/sixdays")); v != 1 {
+		t.Errorf("sixdays 应处于红色集合, got %v", v)
+	}
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/eightdays")); v != 0 {
+		t.Errorf("eightdays 超过一周不应进入红色集合, got %v", v)
 	}
 }
 
