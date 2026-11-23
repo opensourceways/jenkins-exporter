@@ -30,6 +30,11 @@ type Metrics struct {
 	FolderLastSuccessAge *obsmetrics.GaugeVec
 	FolderStaleJobs      *obsmetrics.GaugeVec
 
+	// FolderScrapeSuccess 标记每个 folder 最近一轮是否抓取成功：
+	// 1 成功、0 失败（含启动后尚未抓取）。单个 folder 失败时其余 folder 照常推进，
+	// 该指标用于把「某个 folder 状态已停止更新」暴露出来，避免静默冻结。
+	FolderScrapeSuccess *obsmetrics.GaugeVec
+
 	// JobRed 给出失败 job 的具体身份：仅对「曾经变红」的 job 出序列，恢复后置 0。
 	// 全量 job 都走 folder 聚合，若逐个出序列会产生上千条无用 series；
 	// 而失败 job 通常只有几十个，按需出序列既能让告警带上 job 名，又不增加任何 Jenkins 请求。
@@ -89,6 +94,8 @@ func NewMetrics(om *obsmetrics.Metrics) *Metrics {
 			"folder 内最近一次成功构建距今秒数；0 表示该 folder 从未成功过。", "folder"),
 		FolderStaleJobs: om.NewGaugeVec("jenkins_folder_stale_jobs",
 			"超过 STALE_THRESHOLD 未构建（或从未构建）的 job 数。", "folder"),
+		FolderScrapeSuccess: om.NewGaugeVec("jenkins_folder_scrape_success",
+			"folder 最近一轮是否抓取成功：1 成功，0 失败或尚未抓取；失败时该 folder 沿用上一轮状态。", "folder"),
 		JobRed: om.NewGaugeVec("jenkins_job_red",
 			"job 最近一次已完成构建是否失败且当前未在构建：1 失败，0 已恢复或正在重建。仅对曾经失败的 job 出序列。", "job"),
 		JobLastFailedBuild: om.NewGaugeVec("jenkins_job_last_failed_build",
@@ -109,6 +116,7 @@ func (m *Metrics) InitFolderSeries(folders []string) {
 		m.FolderLastBuildAge.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
 		m.FolderLastSuccessAge.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
 		m.FolderStaleJobs.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
+		m.FolderScrapeSuccess.Vec().WithLabelValues(m.defaultCommunity, f).Set(0)
 	}
 }
 

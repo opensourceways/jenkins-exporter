@@ -185,11 +185,12 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	}
 
 	// folder 聚合路径：每个配置的 folder 一次请求，内存聚合，不产生 per-job series。
-	foldersOK, currentRed, redLastBuild := c.refreshFolders(ctx)
-	// 只有全部 folder 都拉取成功时才推进 red 状态机，否则会把抓取失败的 folder 误判为「已恢复」。
-	if foldersOK && len(c.folderWhitelist) > 0 {
-		c.processRedTransitions(currentRed)
-		// 失败 job 的身份指标与状态机同源，同样只在拉取成功时更新，避免整批置 0。
+	snap := c.refreshFolders(ctx)
+	if len(c.folderWhitelist) > 0 {
+		// 单个 folder 抖动不能冻结全局：成功 folder 以本轮为准，失败 folder 沿用上一轮状态。
+		currentRed, redLastBuild := c.mergeRedState(snap)
+		// 两轮确认只认「实际拉到」的 red：失败 folder 沿用过来的 job 不算新的一次观测。
+		c.processRedTransitions(currentRed, snap.red)
 		c.syncRedJobSeries(currentRed, redLastBuild)
 		c.syncRedJobStreaks(ctx, currentRed, redLastBuild)
 	}
@@ -206,32 +207,48 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 		c.log.Warn("拉取 queue 失败", "err", qerr.Error())
 	}
 
-	success := foldersOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
+	success := snap.allOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
 
 	c.processAndPersist(jobBuilds, computers, computersOK, items, queueOK)
 	c.finalize(success)
 	return success
 }
 
+// folderSnapshot 是一轮 folder 聚合的结果。
+// allOK 供整体自监控（全部成功才把 exporter_scrape_success 置 1）；
+// okFolders 记录本轮成功的 folder，调用方据此只推进这些 folder 的状态。
+type folderSnapshot struct {
+	allOK     bool
+	okFolders map[string]bool
+	red       map[string]bool
+	lastBuild map[string]*jenkins.BuildSummary
+}
+
 // refreshFolders 逐个 folder 拉取直接子 job 摘要并聚合。
-// 返回是否全部 folder 成功、本轮所有 red job 的全路径集合（供失败告警使用），
-// 以及这些 red job 的最近构建摘要（供大盘直达构建页与连续失败次数计算，取不到时为 nil）。
-func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, map[string]*jenkins.BuildSummary) {
-	red := make(map[string]bool)
-	redLastBuild := make(map[string]*jenkins.BuildSummary)
-	if len(c.folderWhitelist) == 0 {
-		return true, red, redLastBuild
+// 某个 folder 失败只影响它自己：本轮其余 folder 的聚合与 red 集合照常产出，
+// 失败 folder 由调用方沿用上一轮状态，并通过 jenkins_folder_scrape_success=0 暴露。
+func (c *Collector) refreshFolders(ctx context.Context) folderSnapshot {
+	snap := folderSnapshot{
+		allOK:     true,
+		okFolders: make(map[string]bool, len(c.folderWhitelist)),
+		red:       make(map[string]bool),
+		lastBuild: make(map[string]*jenkins.BuildSummary),
 	}
-	ok := true
+	if len(c.folderWhitelist) == 0 {
+		return snap
+	}
 	now := time.Now()
 	currentJobs := make(map[string]bool)
 	for _, folder := range c.folderWhitelist {
 		jobs, err := c.src.FolderJobs(ctx, folder)
 		if err != nil {
-			c.log.Warn("拉取 folder job 摘要失败", "folder", folder, "err", err.Error())
-			ok = false
+			c.log.Warn("拉取 folder job 摘要失败，沿用上一轮状态", "folder", folder, "err", err.Error())
+			snap.allOK = false
+			c.metrics.FolderScrapeSuccess.Set(0, folder)
 			continue
 		}
+		snap.okFolders[folder] = true
+		c.metrics.FolderScrapeSuccess.Set(1, folder)
 		c.aggregateFolder(folder, jobs, now, currentJobs)
 		for _, j := range jobs {
 			if jenkins.IsFolderClass(j.Class) {
@@ -243,29 +260,77 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 			}
 			if isFailedJob(&j) {
 				full := folder + "/" + j.Name
-				red[full] = true
-				redLastBuild[full] = j.LastBuild
+				snap.red[full] = true
+				snap.lastBuild[full] = j.LastBuild
 			}
 		}
 	}
-	// 全部 folder 拉取成功才清理已消失的 job：部分失败时无法区分「job 被删」与「这轮没拉到」。
-	if ok {
+	// 只清理「所属 folder 本轮成功、且 job 已消失」的 last_build 序列：
+	// 失败 folder 无法区分「job 被删」与「这轮没拉到」，必须原样保留。
+	if len(snap.okFolders) > 0 {
+		next := make(map[string]bool, len(currentJobs)+len(c.lastBuildJobs))
+		for job := range currentJobs {
+			next[job] = true
+		}
 		for job := range c.lastBuildJobs {
-			if !currentJobs[job] {
-				c.metrics.JobLastBuildTimestamp.Set(0, job)
+			if next[job] {
+				continue
 			}
+			if !snap.okFolders[c.folderOf(job)] {
+				next[job] = true
+				continue
+			}
+			c.metrics.JobLastBuildTimestamp.Set(0, job)
 		}
-		c.lastBuildJobs = currentJobs
+		c.lastBuildJobs = next
 	}
-	return ok, red, redLastBuild
+	return snap
+}
+
+// mergeRedState 生成本轮用于推进状态机的 red 集合。
+// 成功的 folder 以本轮结果为准（可能新增或恢复）；抓取失败的 folder 沿用上一轮的 red 状态，
+// 既不会因为一个 folder 抖动就冻结全局，也不会把「没拉到」误判为「已恢复」。
+// 沿用过来的 job 没有本轮的 lastBuild，指标保留上一轮的构建号。
+func (c *Collector) mergeRedState(snap folderSnapshot) (map[string]bool, map[string]*jenkins.BuildSummary) {
+	if snap.allOK {
+		return snap.red, snap.lastBuild
+	}
+	merged := make(map[string]bool, len(snap.red)+len(c.redSeen))
+	for job := range snap.red {
+		merged[job] = true
+	}
+	for job := range c.redSeen {
+		if merged[job] || snap.okFolders[c.folderOf(job)] {
+			continue
+		}
+		merged[job] = true
+	}
+	return merged, snap.lastBuild
+}
+
+// folderOf 返回 job 全路径所属的 FOLDER_WHITELIST 条目（最长前缀匹配）。
+// 找不到匹配时返回空串，调用方会保守地按「所属 folder 未成功」保留原状态。
+func (c *Collector) folderOf(job string) string {
+	best := ""
+	for _, f := range c.folderWhitelist {
+		if len(f) >= len(job) || job[len(f)] != '/' || !strings.HasPrefix(job, f) {
+			continue
+		}
+		if len(f) > len(best) {
+			best = f
+		}
+	}
+	return best
 }
 
 // processRedTransitions 推进失败 job 状态机并输出告警日志。
-// 规则：连续两轮 red 才告警；同一 job 在恢复为绿之前只告警一次。
-func (c *Collector) processRedTransitions(current map[string]bool) {
+// 规则：连续两轮实际拉到 red 才告警；同一 job 在恢复为绿之前只告警一次。
+// current 是合并后的 red 集合（含失败 folder 沿用过来的 job），fresh 是本轮真实拉到的 red；
+// 只有 fresh 里的 job 才算「新的一次观测」，避免抓取失败也被当成确认。
+func (c *Collector) processRedTransitions(current, fresh map[string]bool) {
 	var toAlert []string
 	for job := range current {
-		if c.redSeen[job] && !c.alerted[job] {
+		if fresh[job] && c.redSeen[job] && !c.alerted[job] {
 			toAlert = append(toAlert, job)
 		}
 	}
