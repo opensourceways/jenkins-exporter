@@ -69,10 +69,11 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_folder_last_build_age_seconds` | gauge | `folder` | folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建 |
 | `jenkins_folder_last_success_age_seconds` | gauge | `folder` | folder 内最近一次成功构建距今秒数；0 表示从未成功过。用于识别「一直在跑但一直失败」的 job |
 | `jenkins_folder_stale_jobs` | gauge | `folder` | 曾经构建过、但超过 `STALE_THRESHOLD` 未再构建的 job 数；从未构建的 job（notbuilt）不计入 |
+| `jenkins_folder_scrape_success` | gauge | `folder` | folder 最近一轮是否抓取成功：1 成功、0 失败或尚未抓取。失败时该 folder 沿用上一轮状态，其余 folder 照常推进 |
 | `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 最近一次已完成构建失败且当前没有构建在跑、0 已恢复或正在重建（恢复后保留 0 值序列） |
 | `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复或正在重建。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
 | `jenkins_job_last_build_timestamp_seconds` | gauge | `job` | folder 内叶子 job 最近一次构建的时间戳（秒）；0 表示从未构建。用于「超过一天没有执行」告警；job 被移除后置 0 |
-| `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：最近一次刷新是否成功 |
+| `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：整体是否可用。computer/queue 拉取成功，且（配置了 folder 时）至少一个 folder 拉到数据；全部 folder 失败或 computer/queue 失败才置 0。单个 folder 失败看 `jenkins_folder_scrape_success` |
 | `jenkins_exporter_last_refresh_timestamp_seconds` | gauge | 无 | 自监控：最近一次刷新完成时间（秒） |
 
 **连续失败计数规则：** `FAILURE` → +1；`SUCCESS` → 清零；`UNSTABLE`/`ABORTED` → 不变（中性）；未知 result → 不参与计数但推进水位线。
@@ -84,7 +85,7 @@ folder 聚合指标只保留汇总，不暴露 job 身份。为了能定位到�
 - **连续两轮 red 才告警**：首轮变红视为偶发抖动，不输出；下一轮仍为 red 才输出，过滤掉瞬时失败。
 - **同一故障只告警一次**：job 恢复为绿之前不重复输出，恢复后再次变红会重新走「两轮」判定。
 - **每轮最多 50 条**：超出部分汇总为一条「本轮另有 job 连续失败，已省略」，避免大规模故障刷爆日志。
-- **抓取失败不推进状态**：某轮 folder 拉取失败时跳过状态机，避免把「没采到」误判成「已恢复」。
+- **抓取失败不推进该 folder**：某轮 folder 拉取失败时，该 folder 跳过状态机并沿用上一轮状态，其余 folder 照常推进；既避免把「没采到」误判成「已恢复」，也不会因一个 folder 抖动冻结全局。失败由 `jenkins_folder_scrape_success=0` 暴露。
 
 同一状态机还顺带产出 `jenkins_job_red` 与 `jenkins_job_last_failed_build`：前者是失败 job 身份，后者给出最近一次失败的构建编号（配合 `job_url` 拼出构建日志页），大盘表格据此可一键跳转失败现场。
 

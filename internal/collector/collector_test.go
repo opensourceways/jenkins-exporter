@@ -1062,6 +1062,7 @@ func TestFolderMetricsFamiliesExposed(t *testing.T) {
 		"jenkins_folder_last_build_age_seconds",
 		"jenkins_folder_last_success_age_seconds",
 		"jenkins_folder_stale_jobs",
+		"jenkins_folder_scrape_success",
 	} {
 		if !strings.Contains(body, "# HELP "+name) || !strings.Contains(body, "# TYPE "+name) {
 			t.Errorf("缺少指标族 %q 的 HELP/TYPE", name)
@@ -1191,6 +1192,66 @@ func TestJobRedSeriesKeptWhenFolderFetchFails(t *testing.T) {
 	col.RefreshOnce(context.Background())
 	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, testFolder+"/broken")); v != 1 {
 		t.Errorf("抓取失败后应保持 1, got %v", v)
+	}
+}
+
+// 单个 folder 抓取失败只影响它自己：成功的 folder 照常推进（新增/恢复），
+// 失败的 folder 沿用上一轮状态，并通过 jenkins_folder_scrape_success 暴露。
+func TestFolderPartialFailureDoesNotBlockOthers(t *testing.T) {
+	const folderA = "a"
+	const folderB = "b"
+	src := &mockSource{
+		folderJobsByPath: map[string][]jenkins.Job{
+			folderA: {{Name: "x", Class: folderProject, Color: "red"}},
+			folderB: {{Name: "y", Class: folderProject, Color: "red"}},
+		},
+		computers: []jenkins.Computer{{DisplayName: "a0"}},
+	}
+	col, _, m := newCollectorFull(t, src, nil, []string{folderA, folderB}, nil, 24*time.Hour)
+	col.RefreshOnce(context.Background())
+
+	// 第 2 轮：A 恢复为蓝，B 拉取失败。
+	src.folderJobsByPath[folderA][0].Color = "blue"
+	src.folderJobsErr = map[string]error{folderB: jenkins.ErrUnauthorized}
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Error("单个 folder 失败不应判定整体失败")
+	}
+
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, folderA+"/x")); v != 0 {
+		t.Errorf("成功 folder 的恢复应生效, jenkins_job_red = %v, want 0", v)
+	}
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, folderB+"/y")); v != 1 {
+		t.Errorf("失败 folder 应沿用上一轮状态, jenkins_job_red = %v, want 1", v)
+	}
+	if v := testutil.ToFloat64(m.FolderScrapeSuccess.Vec().WithLabelValues(testCommunity, folderA)); v != 1 {
+		t.Errorf("成功 folder 的 scrape_success = %v, want 1", v)
+	}
+	if v := testutil.ToFloat64(m.FolderScrapeSuccess.Vec().WithLabelValues(testCommunity, folderB)); v != 0 {
+		t.Errorf("失败 folder 的 scrape_success = %v, want 0", v)
+	}
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 1 {
+		t.Errorf("单个 folder 失败时全局 scrape_success = %v, want 1", v)
+	}
+
+	// 第 3 轮：两个 folder 都失败 → 真正失明，全局置 0。
+	src.folderJobsErr = map[string]error{
+		folderA: jenkins.ErrUnauthorized,
+		folderB: jenkins.ErrUnauthorized,
+	}
+	if ok := col.RefreshOnce(context.Background()); ok {
+		t.Error("全部 folder 失败应判定整体失败")
+	}
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 0 {
+		t.Errorf("全部 folder 失败时全局 scrape_success = %v, want 0", v)
+	}
+
+	// 第 4 轮：全部恢复 → 全局回到 1。
+	src.folderJobsErr = nil
+	if ok := col.RefreshOnce(context.Background()); !ok {
+		t.Error("全部恢复后应判定整体成功")
+	}
+	if v := testutil.ToFloat64(m.ExporterScrapeSuccess.Vec().WithLabelValues(testCommunity)); v != 1 {
+		t.Errorf("恢复后全局 scrape_success = %v, want 1", v)
 	}
 }
 

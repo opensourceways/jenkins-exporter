@@ -107,7 +107,7 @@ RefreshOnce
 
 ### 4.3 指标定义
 
-新增 5 个 folder 级指标（全部为 gauge，快照型，无需 state 水位线）：
+新增 6 个 folder 级指标（全部为 gauge，快照型，无需 state 水位线）：
 
 | 指标 | 标签 | 含义 |
 |---|---|---|
@@ -116,6 +116,7 @@ RefreshOnce
 | `jenkins_folder_last_build_age_seconds` | `folder` | 该 folder 内最近一次构建距今秒数（0 表示无构建） |
 | `jenkins_folder_last_success_age_seconds` | `folder` | 该 folder 内最近一次**成功**构建距今秒数（0 表示从未成功）。与上一条配合可识别「一直在跑但一直失败」的 job——这类 job 的 last_build_age 很小，看起来健康 |
 | `jenkins_folder_stale_jobs` | `folder` | 超过 `STALE_THRESHOLD` 未构建的 job 数 |
+| `jenkins_folder_scrape_success` | `folder` | folder 最近一轮是否抓取成功：1 成功、0 失败或尚未抓取；失败时该 folder 沿用上一轮状态，其余 folder 照常推进 |
 
 同时补齐 2 个「数据已在手但未输出」的全局指标（零新增请求）：
 
@@ -135,7 +136,7 @@ RefreshOnce
 | `notbuilt` | 从未构建 |
 | `disabled` | 已禁用 |
 
-series 数估算：4 个 folder ×（1 个总数 + 7 个 color + 3 个 age/stale）= **44 条**，对比 per-job 方案 8 万条。
+series 数估算：4 个 folder ×（1 个总数 + 7 个 color + 3 个 age/stale + 1 个抓取状态）= **48 条**，对比 per-job 方案 8 万条。
 
 ### 4.4 失败 job 定位告警（日志方案）
 
@@ -265,7 +266,7 @@ func (c *Client) FolderJobs(ctx context.Context, jobPath string) ([]Job, error) 
 | 风险 | 影响 | 应对 |
 |---|---|---|
 | folder 下 job 数继续增长 | 单次响应变大（当前 2.3MB/0.5s） | 加 `HTTP_TIMEOUT` 保护；超过阈值告警；必要时按子 folder 拆分配置 |
-| 大 folder 响应超时 | 聚合数据缺失 | `FolderJobs` 失败时只影响该 folder，`scrape_success` 记为部分失败，不影响精确 job 路径 |
+| 大 folder 响应超时 | 聚合数据缺失 | `FolderJobs` 失败时只影响该 folder，`jenkins_folder_scrape_success` 记为 0，其余 folder 与精确 job 路径照常推进；全部 folder 都失败才把全局 `scrape_success` 置 0 |
 | `DataSource` 接口变更 | offline / 测试桩需同步实现 | 已在清单中列出，改动点明确 |
 | Jenkins 权限收紧匿名读 | 采集 401 | 现有 token 机制不变，仅换 tree 参数 |
 
