@@ -241,7 +241,7 @@ func (c *Collector) refreshFolders(ctx context.Context) (bool, map[string]bool, 
 			if isDeadJob(&j, now) {
 				continue
 			}
-			if normalizeColor(j.Color) == "red" {
+			if isFailedJob(&j) {
 				full := folder + "/" + j.Name
 				red[full] = true
 				redLastBuild[full] = j.LastBuild
@@ -380,6 +380,18 @@ func normalizeColor(color string) string {
 		}
 	}
 	return "unknown"
+}
+
+// isFailedJob 判断 job 是否处于「最近一次已完成构建失败」这一可告警状态。
+// Jenkins 的 color 带 _anime 后缀表示 job 正在构建：red_anime 只说明「上次构建失败、
+// 现在又在重建」，此时 lastBuild 是进行中的构建（result 为 null）。若把 red_anime 当作失败，
+// CI 一触发就会报失败，且构建号指向一个还没结束的构建，因此构建中一律不算失败：
+// 重建成功后转绿，重建再次失败时 color 回到 red，会重新告警。
+func isFailedJob(j *jenkins.Job) bool {
+	if strings.HasSuffix(j.Color, "_anime") {
+		return false
+	}
+	return normalizeColor(j.Color) == "red"
 }
 
 // processAndPersist 执行 delta 计算、指标更新与 state 持久化。

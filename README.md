@@ -69,8 +69,8 @@ curl -s localhost:9300/healthz   # ok
 | `jenkins_folder_last_build_age_seconds` | gauge | `folder` | folder 内最近一次构建距今秒数；0 表示该 folder 无任何构建 |
 | `jenkins_folder_last_success_age_seconds` | gauge | `folder` | folder 内最近一次成功构建距今秒数；0 表示从未成功过。用于识别「一直在跑但一直失败」的 job |
 | `jenkins_folder_stale_jobs` | gauge | `folder` | 曾经构建过、但超过 `STALE_THRESHOLD` 未再构建的 job 数；从未构建的 job（notbuilt）不计入 |
-| `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 当前红色、0 已恢复（恢复后保留 0 值序列） |
-| `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
+| `jenkins_job_red` | gauge | `job` | folder 聚合顺带产出的失败 job 身份：1 最近一次已完成构建失败且当前没有构建在跑、0 已恢复或正在重建（恢复后保留 0 值序列） |
+| `jenkins_job_last_failed_build` | gauge | `job`, `job_url` | 失败 job 最近一次失败的构建编号；0 表示已恢复或正在重建。`job_url` 是 job 页面地址（不含构建号），与编号拼出构建日志页链接 |
 | `jenkins_job_last_build_timestamp_seconds` | gauge | `job` | folder 内叶子 job 最近一次构建的时间戳（秒）；0 表示从未构建。用于「超过一天没有执行」告警；job 被移除后置 0 |
 | `jenkins_exporter_scrape_success` | gauge | 无 | 自监控：最近一次刷新是否成功 |
 | `jenkins_exporter_last_refresh_timestamp_seconds` | gauge | 无 | 自监控：最近一次刷新完成时间（秒） |
@@ -87,6 +87,8 @@ folder 聚合指标只保留汇总，不暴露 job 身份。为了能定位到�
 - **抓取失败不推进状态**：某轮 folder 拉取失败时跳过状态机，避免把「没采到」误判成「已恢复」。
 
 同一状态机还顺带产出 `jenkins_job_red` 与 `jenkins_job_last_failed_build`：前者是失败 job 身份，后者给出最近一次失败的构建编号（配合 `job_url` 拼出构建日志页），大盘表格据此可一键跳转失败现场。
+
+**「失败」的判定口径：** 只认「最近一次已完成构建失败且当前没有构建在跑」。Jenkins 的 `red_anime` 表示「上次失败后又在重建」，此时 `lastBuild` 是进行中的构建（`result` 为 `null`），不算失败，`jenkins_job_red` 与 `jenkins_job_last_failed_build` 都回落 0——避免 CI 一触发就告警、以及把构建号指向未完成的构建；重建成功后转绿，重建再次失败则重新告警。folder 级 `jenkins_folder_jobs_by_color` 仍按 Jenkins color 归一化（`red_anime` 计入 red），用于展示当前状态分布。
 
 日志示例：
 

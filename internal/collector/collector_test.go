@@ -1111,11 +1111,14 @@ func TestJobWhitelistFetchesDirectlyWithoutEnumeration(t *testing.T) {
 	}
 }
 
-// 失败 job 的身份指标：只有 red 的 job 出序列，blue 的 job 不出。
+// 失败 job 的身份指标：只有「已完成构建失败」的 job 出序列，blue 与正在重建的 job 都不出。
 func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
-			{Name: "broken", Class: folderProject, Color: "red_anime"},
+			// 已完成构建失败：出序列。
+			{Name: "broken", Class: folderProject, Color: "red"},
+			// 失败后正在重建：构建中不算失败，否则 CI 一触发就误报。
+			{Name: "rebuilding", Class: folderProject, Color: "red_anime"},
 			{Name: "ok", Class: folderProject, Color: "blue"},
 		}},
 		computers: []jenkins.Computer{{DisplayName: "a0"}},
@@ -1127,7 +1130,7 @@ func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
 		t.Errorf("red job 序列 = %v, want 1", v)
 	}
 	body := promText(t, reg)
-	var redBroken, redOK bool
+	var redBroken, redRebuilding, redOK bool
 	for _, line := range strings.Split(body, "\n") {
 		if !strings.HasPrefix(line, "jenkins_job_red{") {
 			continue
@@ -1135,12 +1138,18 @@ func TestJobRedSeriesMarksOnlyFailedJobs(t *testing.T) {
 		if strings.Contains(line, `job="`+testFolder+`/broken"`) {
 			redBroken = true
 		}
+		if strings.Contains(line, `job="`+testFolder+`/rebuilding"`) {
+			redRebuilding = true
+		}
 		if strings.Contains(line, `job="`+testFolder+`/ok"`) {
 			redOK = true
 		}
 	}
 	if !redBroken {
 		t.Errorf("缺少 red job 序列: %s", body)
+	}
+	if redRebuilding {
+		t.Errorf("构建中的 job 不应产生 jenkins_job_red 序列: %s", body)
 	}
 	if redOK {
 		t.Errorf("blue job 不应产生 jenkins_job_red 序列: %s", body)
@@ -1186,11 +1195,11 @@ func TestJobRedSeriesKeptWhenFolderFetchFails(t *testing.T) {
 }
 
 // 失败 job 的构建号：值取 lastBuild.number，job_url 为恒定的 job 页面地址，
-// 大盘用 job_url + 值拼出构建日志页。
+// 大盘用 job_url + 值拼出构建日志页。构建中（red_anime）不算失败，指标应回落 0。
 func TestJobLastFailedBuildAndURL(t *testing.T) {
 	src := &mockSource{
 		folderJobsByPath: map[string][]jenkins.Job{testFolder: {
-			{Name: "broken", Class: folderProject, Color: "red_anime", LastBuild: &jenkins.BuildSummary{Number: 1221}},
+			{Name: "broken", Class: folderProject, Color: "red", LastBuild: &jenkins.BuildSummary{Number: 1221}},
 			{Name: "ok", Class: folderProject, Color: "blue"},
 		}},
 		computers: []jenkins.Computer{{DisplayName: "a0"}},
@@ -1206,6 +1215,28 @@ func TestJobLastFailedBuildAndURL(t *testing.T) {
 	wantURL := "https://ci.example.com/job/" + strings.ReplaceAll(job, "/", "/job/")
 	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, job, wantURL)); v != 1221 {
 		t.Errorf("失败构建号 = %v, want 1221", v)
+	}
+
+	// 失败后重新触发构建：lastBuild 变成进行中的构建（result 为 null），
+	// 此时不算失败——避免「CI 刚触发就告警」以及把构建号指向未完成的构建。
+	src.folderJobsByPath[testFolder][0].Color = "red_anime"
+	src.folderJobsByPath[testFolder][0].LastBuild = &jenkins.BuildSummary{Number: 1222}
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, job)); v != 0 {
+		t.Errorf("构建中 jenkins_job_red 应为 0, got %v", v)
+	}
+	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, job, wantURL)); v != 0 {
+		t.Errorf("构建中失败构建号应为 0, got %v", v)
+	}
+
+	// 重建再次失败：color 回到 red，恢复告警并指向新的失败构建号。
+	src.folderJobsByPath[testFolder][0].Color = "red"
+	col.RefreshOnce(context.Background())
+	if v := testutil.ToFloat64(m.JobRed.Vec().WithLabelValues(testCommunity, job)); v != 1 {
+		t.Errorf("再次失败后 jenkins_job_red 应为 1, got %v", v)
+	}
+	if v := testutil.ToFloat64(m.JobLastFailedBuild.Vec().WithLabelValues(testCommunity, job, wantURL)); v != 1222 {
+		t.Errorf("再次失败构建号 = %v, want 1222", v)
 	}
 
 	// 恢复正常后构建号应清零，避免大盘继续展示已修复的历史失败。
