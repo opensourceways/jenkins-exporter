@@ -155,8 +155,9 @@ func (c *Collector) backoff(failures int) time.Duration {
 }
 
 // RefreshOnce 执行一次完整刷新，返回是否整体成功。
-// 整体成功 = job 列表（配置了精确白名单时）、folder 聚合、computer、queue 拉取均成功，
-// 且（有精确白名单时）至少一个 job 构建拉取成功。
+// 整体成功 = computer、queue 拉取成功，（有精确白名单时）至少一个 job 构建拉取成功，
+// 且（配置了 folder 时）至少一个 folder 拉到数据。单个 folder 失败只影响该 folder，
+// 其陈旧由 jenkins_folder_scrape_success 暴露，不把全局自监控置 0。
 func (c *Collector) RefreshOnce(ctx context.Context) bool {
 	if err := ctx.Err(); err != nil {
 		c.finalize(false)
@@ -207,7 +208,10 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 		c.log.Warn("拉取 queue 失败", "err", qerr.Error())
 	}
 
-	success := snap.allOK && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
+	// 单个 folder 抖动不等于整体失明：只要还有 folder 拿到数据，全局自监控就保持成功，
+	// 失败 folder 的陈旧由 jenkins_folder_scrape_success=0 暴露；全部 folder 都失败才置 0。
+	foldersAllFailed := len(c.folderWhitelist) > 0 && len(snap.okFolders) == 0
+	success := !foldersAllFailed && computersOK && queueOK && (len(targets) == 0 || jobOK > 0)
 
 	c.processAndPersist(jobBuilds, computers, computersOK, items, queueOK)
 	c.finalize(success)
@@ -215,7 +219,8 @@ func (c *Collector) RefreshOnce(ctx context.Context) bool {
 }
 
 // folderSnapshot 是一轮 folder 聚合的结果。
-// allOK 供整体自监控（全部成功才把 exporter_scrape_success 置 1）；
+// allOK 表示本轮所有 folder 都拉到，供 mergeRedState 选择快路径；
+// 全局自监控不再以它为准（单个 folder 失败不算整体失明）。
 // okFolders 记录本轮成功的 folder，调用方据此只推进这些 folder 的状态。
 type folderSnapshot struct {
 	allOK     bool
